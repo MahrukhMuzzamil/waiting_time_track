@@ -7,6 +7,9 @@ from typing import Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import torch
+import torchvision.transforms as T
+from torchvision.models import resnet18, ResNet18_Weights
 
 
 @dataclass
@@ -136,6 +139,83 @@ class IoUTracker:
         return state.start_time_s if state else None
 
 
+class ReIDMemory:
+    """
+    Lightweight re-identification memory based on ResNet18 embeddings.
+    It stores an embedding per persistent person_id and matches new crops
+    by cosine similarity to reconnect identities after occlusions or exits.
+    """
+
+    def __init__(self, similarity_threshold: float = 0.62, ttl_seconds: float = 600.0) -> None:
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        weights = ResNet18_Weights.DEFAULT
+        backbone = resnet18(weights=weights)
+        # Remove classification head -> use global pooled features
+        self.feature_extractor = torch.nn.Sequential(*(list(backbone.children())[:-1])).to(self.device)
+        self.feature_extractor.eval()
+        # Torchvision versions differ on where mean/std live; fall back to ImageNet defaults
+        imagenet_mean = [0.485, 0.456, 0.406]
+        imagenet_std = [0.229, 0.224, 0.225]
+        meta = getattr(weights, 'meta', {}) or {}
+        mean = meta.get('mean', imagenet_mean)
+        std = meta.get('std', imagenet_std)
+
+        self.transform = T.Compose([
+            T.ToPILImage(),
+            T.Resize((224, 224)),
+            T.ToTensor(),
+            T.Normalize(mean=mean, std=std),
+        ])
+
+        self.person_id_to_embedding: Dict[int, torch.Tensor] = {}
+        self.person_id_to_last_seen: Dict[int, float] = {}
+        self.next_person_id: int = 1
+        self.similarity_threshold = similarity_threshold
+        self.ttl_seconds = ttl_seconds
+
+    @staticmethod
+    def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
+        a = a.flatten()
+        b = b.flatten()
+        return torch.nn.functional.cosine_similarity(a, b, dim=0).item()
+
+    def _extract_embedding(self, crop_bgr: np.ndarray) -> torch.Tensor:
+        with torch.no_grad():
+            img = self.transform(crop_bgr[:, :, ::-1]).unsqueeze(0).to(self.device)  # BGR -> RGB
+            feat = self.feature_extractor(img)  # [1, 512, 1, 1]
+            feat = torch.nn.functional.normalize(feat.view(1, -1), dim=1)  # [1, 512]
+        return feat.squeeze(0).cpu()
+
+    def assign_person_id(self, crop_bgr: np.ndarray, now_s: float) -> int:
+        emb = self._extract_embedding(crop_bgr)
+        # Purge old entries
+        expired = [pid for pid, ts in self.person_id_to_last_seen.items() if now_s - ts > self.ttl_seconds]
+        for pid in expired:
+            self.person_id_to_last_seen.pop(pid, None)
+            self.person_id_to_embedding.pop(pid, None)
+
+        # Find best match
+        best_pid = None
+        best_sim = -1.0
+        for pid, ref in self.person_id_to_embedding.items():
+            sim = self._cosine_similarity(emb, ref)
+            if sim > best_sim:
+                best_sim = sim
+                best_pid = pid
+
+        if best_pid is not None and best_sim >= self.similarity_threshold:
+            self.person_id_to_embedding[best_pid] = 0.5 * self.person_id_to_embedding[best_pid] + 0.5 * emb
+            self.person_id_to_last_seen[best_pid] = now_s
+            return best_pid
+
+        # New identity
+        pid = self.next_person_id
+        self.next_person_id += 1
+        self.person_id_to_embedding[pid] = emb
+        self.person_id_to_last_seen[pid] = now_s
+        return pid
+
+
 def format_hms(seconds: float) -> str:
     seconds = max(0, int(seconds))
     h = seconds // 3600
@@ -170,6 +250,8 @@ def main() -> None:
     parser.add_argument("--max-missing", type=int, default=30, help="Frames to keep track alive without detection")
     parser.add_argument("--iou", type=float, default=0.3, help="IoU threshold to match detections to tracks")
     parser.add_argument("--show-fps", action="store_true", help="Overlay FPS counter")
+    parser.add_argument("--reid", action="store_true", help="Enable ReID to persist identity across occlusions")
+    parser.add_argument("--reid-sim", type=float, default=0.62, help="Cosine similarity threshold for ReID match")
     args = parser.parse_args()
 
     # Resolve source
@@ -189,6 +271,9 @@ def main() -> None:
     last_time = time.time()
 
     tracker = IoUTracker(max_missing_frames=args.max_missing, iou_match_threshold=args.iou)
+    reid: Optional[ReIDMemory] = None
+    if args.reid:
+        reid = ReIDMemory(similarity_threshold=args.reid_sim)
 
     frame_idx = 0
     window_name = "Clinic Wait-Time Prototype"
@@ -236,10 +321,29 @@ def main() -> None:
                 # Bounding box
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
 
-                # Waiting time
-                start_time_s = tracker.get_track_start_time(tid) or now_s
+                # Assign persistent person ID via ReID (optional)
+                label_id = tid
+                if reid is not None:
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0 and crop.shape[0] > 10 and crop.shape[1] > 10:
+                        label_id = reid.assign_person_id(crop, now_s)
+
+                # Waiting time based on first-seen time per tracker track; for persistent person id,
+                # we can keep a dictionary that tracks earliest start per person id.
+                # Here we store start per person id when ReID is enabled.
+                if not hasattr(main, "person_start_times"):
+                    main.person_start_times = {}
+
+                if reid is not None:
+                    if label_id not in main.person_start_times:
+                        start_time_s = tracker.get_track_start_time(tid) or now_s
+                        main.person_start_times[label_id] = start_time_s
+                    start_time_s = main.person_start_times[label_id]
+                else:
+                    start_time_s = tracker.get_track_start_time(tid) or now_s
+
                 wait_s = now_s - start_time_s
-                time_text = f"ID {tid} · {format_hms(wait_s)}"
+                time_text = f"ID {label_id} · {format_hms(wait_s)}"
 
                 # Place label above head (top-center of bbox)
                 label_x = int((x1 + x2) / 2)
