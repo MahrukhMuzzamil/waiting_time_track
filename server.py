@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 from flask import Flask, Response, render_template_string
 from ultralytics import YOLO
+import torch
 
 from main import (
     IoUTracker,
@@ -17,6 +18,18 @@ from main import (
 
 
 app = Flask(__name__)
+
+# Constrain CPU thread usage for low-memory environments (Render Free)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
 
 
 # Load environment
@@ -67,8 +80,27 @@ def frame_generator():
             else:
                 fps_smoother = 0.9 * fps_smoother + 0.1 * (1.0 / max(dt, 1e-6))
 
-            # YOLO inference for persons
-            results = model.predict(source=frame, imgsz=640, conf=CONF_THRESHOLD, classes=[0], verbose=False)
+            # YOLO inference for persons (reduced memory)
+            # Downscale frame slightly to reduce memory/CPU
+            ih, iw = frame.shape[:2]
+            scale = 640 / max(iw, ih)
+            if scale < 1.0:
+                new_w = max(320, int(iw * scale))
+                new_h = max(240, int(ih * scale))
+                frame_infer = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            else:
+                frame_infer = frame
+
+            with torch.no_grad():
+                results = model.predict(
+                    source=frame_infer,
+                    imgsz=640,
+                    conf=CONF_THRESHOLD,
+                    classes=[0],
+                    verbose=False,
+                    device="cpu",
+                    fuse=False,  # avoid Conv+BN fusion to reduce memory spikes
+                )
 
             boxes_xyxy: List[np.ndarray] = []
             if results and len(results) > 0:
