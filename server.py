@@ -111,8 +111,7 @@ def frame_generator():
             if not ok:
                 continue
             jpg = buff.tobytes()
-            yield (b"--frame\r\n"
-                   b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
 
         except Exception:
             # Backoff on errors

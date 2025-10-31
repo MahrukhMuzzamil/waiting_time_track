@@ -57,9 +57,7 @@ class IoUTracker:
         # Prepare cost matrix as 1 - IoU
         track_ids = list(self._tracks.keys())
         existing_boxes = (
-            np.array([self._tracks[tid].last_bbox_xyxy for tid in track_ids])
-            if track_ids
-            else np.zeros((0, 4))
+            np.array([self._tracks[tid].last_bbox_xyxy for tid in track_ids]) if track_ids else np.zeros((0, 4))
         )
         if existing_boxes.size > 0 and detections.size > 0:
             iou_matrix = np.zeros((existing_boxes.shape[0], detections.shape[0]), dtype=np.float32)
@@ -131,8 +129,7 @@ class IoUTracker:
 
         # Drop stale tracks
         to_delete = [
-            tid for tid, st in self._tracks.items()
-            if frame_idx - st.last_seen_frame > self.max_missing_frames
+            tid for tid, st in self._tracks.items() if frame_idx - st.last_seen_frame > self.max_missing_frames
         ]
         for tid in to_delete:
             del self._tracks[tid]
@@ -166,12 +163,14 @@ class ReIDMemory:
         mean = meta.get('mean', imagenet_mean)
         std = meta.get('std', imagenet_std)
 
-        self.transform = T.Compose([
-            T.ToPILImage(),
-            T.Resize((224, 224)),
-            T.ToTensor(),
-            T.Normalize(mean=mean, std=std),
-        ])
+        self.transform = T.Compose(
+            [
+                T.ToPILImage(),
+                T.Resize((224, 224)),
+                T.ToTensor(),
+                T.Normalize(mean=mean, std=std),
+            ]
+        )
 
         self.person_id_to_embedding: Dict[int, torch.Tensor] = {}
         self.person_id_to_last_seen: Dict[int, float] = {}
@@ -365,16 +364,12 @@ def open_rtsp_with_fallbacks(rtsp_url: str, on_success: Optional[callable] = Non
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Realtime waiting-time overlay prototype (webcam)"
-    )
+    parser = argparse.ArgumentParser(description="Realtime waiting-time overlay prototype (webcam)")
     parser.add_argument(
         "--source",
         type=str,
         default="auto",
-        help=(
-            "Camera index, video path, RTSP url, or 'auto' to load saved RTSP"
-        ),
+        help=("Camera index, video path, RTSP url, or 'auto' to load saved RTSP"),
     )
     parser.add_argument(
         "--conf",
