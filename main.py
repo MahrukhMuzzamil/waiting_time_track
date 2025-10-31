@@ -2,7 +2,6 @@ import argparse
 import os
 import json
 import time
-from collections import defaultdict
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -57,7 +56,11 @@ class IoUTracker:
 
         # Prepare cost matrix as 1 - IoU
         track_ids = list(self._tracks.keys())
-        existing_boxes = np.array([self._tracks[tid].last_bbox_xyxy for tid in track_ids]) if track_ids else np.zeros((0, 4))
+        existing_boxes = (
+            np.array([self._tracks[tid].last_bbox_xyxy for tid in track_ids])
+            if track_ids
+            else np.zeros((0, 4))
+        )
         if existing_boxes.size > 0 and detections.size > 0:
             iou_matrix = np.zeros((existing_boxes.shape[0], detections.shape[0]), dtype=np.float32)
             for i, tbox in enumerate(existing_boxes):
@@ -312,13 +315,23 @@ def generate_rtsp_candidates(rtsp_url: str) -> List[str]:
     # Dahua-style paths (some OEMs too)
     for cam_idx in (1, 2, 3, 4):
         for subtype in (0, 1):  # 0 main, 1 sub
-            add_unique(with_path_and_query(f"/cam/realmonitor", {"channel": str(cam_idx), "subtype": str(subtype)}))
+            add_unique(
+                with_path_and_query(
+                    "/cam/realmonitor",
+                    {"channel": str(cam_idx), "subtype": str(subtype)},
+                )
+            )
 
     # Uniview-like variants
     for cam_idx in (1, 2, 3, 4):
         for subtype in (0, 1):
             add_unique(with_path_and_query(f"/live/ch{cam_idx}0{subtype}"))
-            add_unique(with_path_and_query(f"/live", {"channel": f"{cam_idx}", "subtype": f"{subtype}"}))
+            add_unique(
+                with_path_and_query(
+                    "/live",
+                    {"channel": f"{cam_idx}", "subtype": f"{subtype}"},
+                )
+            )
 
     return candidates
 
@@ -343,15 +356,56 @@ def open_rtsp_with_fallbacks(rtsp_url: str, on_success: Optional[callable] = Non
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Realtime waiting-time overlay prototype (webcam)")
-    parser.add_argument("--source", type=str, default="auto", help="Camera index, video path, RTSP url, or 'auto' to load saved RTSP")
-    parser.add_argument("--conf", type=float, default=0.4, help="Confidence threshold for person detections")
-    parser.add_argument("--max-missing", type=int, default=30, help="Frames to keep track alive without detection")
-    parser.add_argument("--iou", type=float, default=0.3, help="IoU threshold to match detections to tracks")
-    parser.add_argument("--show-fps", action="store_true", help="Overlay FPS counter")
-    parser.add_argument("--no-window", action="store_true", help="Run without display window (for autostart)")
-    parser.add_argument("--reid", action="store_true", help="Enable ReID to persist identity across occlusions")
-    parser.add_argument("--reid-sim", type=float, default=0.62, help="Cosine similarity threshold for ReID match")
+    parser = argparse.ArgumentParser(
+        description="Realtime waiting-time overlay prototype (webcam)"
+    )
+    parser.add_argument(
+        "--source",
+        type=str,
+        default="auto",
+        help=(
+            "Camera index, video path, RTSP url, or 'auto' to load saved RTSP"
+        ),
+    )
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=0.4,
+        help="Confidence threshold for person detections",
+    )
+    parser.add_argument(
+        "--max-missing",
+        type=int,
+        default=30,
+        help="Frames to keep track alive without detection",
+    )
+    parser.add_argument(
+        "--iou",
+        type=float,
+        default=0.3,
+        help="IoU threshold to match detections to tracks",
+    )
+    parser.add_argument(
+        "--show-fps",
+        action="store_true",
+        help="Overlay FPS counter",
+    )
+    parser.add_argument(
+        "--no-window",
+        action="store_true",
+        help="Run without display window (for autostart)",
+    )
+    parser.add_argument(
+        "--reid",
+        action="store_true",
+        help="Enable ReID to persist identity across occlusions",
+    )
+    parser.add_argument(
+        "--reid-sim",
+        type=float,
+        default=0.62,
+        help="Cosine similarity threshold for ReID match",
+    )
     args = parser.parse_args()
 
     # Config helpers for persisting RTSP
@@ -382,7 +436,7 @@ def main() -> None:
         saved = load_saved_rtsp()
         if saved:
             source = saved
-            print(f"[CONFIG] Loaded saved RTSP from config.json")
+            print("[CONFIG] Loaded saved RTSP from config.json")
         else:
             raise RuntimeError("No saved RTSP found in config.json. Provide --source <rtsp-url> once to save it.")
     elif args.source.isdigit():
@@ -430,7 +484,13 @@ def main() -> None:
                 fps_smoother = 0.9 * fps_smoother + 0.1 * (1.0 / max(dt, 1e-6))
 
             # Run YOLO inference
-            results = model.predict(source=frame, imgsz=640, conf=args.conf, classes=[0], verbose=False)
+            results = model.predict(
+                source=frame,
+                imgsz=640,
+                conf=args.conf,
+                classes=[0],
+                verbose=False,
+            )
 
             boxes_xyxy: List[np.ndarray] = []
             if results and len(results) > 0:
@@ -483,7 +543,13 @@ def main() -> None:
                 # Place label above head (top-center of bbox)
                 label_x = int((x1 + x2) / 2)
                 label_y = max(0, y1 - 6)
-                draw_label_with_background(frame, time_text, (label_x, label_y), font_scale=0.6, bg_color=(50, 50, 50))
+                draw_label_with_background(
+                    frame,
+                    time_text,
+                    (label_x, label_y),
+                    font_scale=0.6,
+                    bg_color=(50, 50, 50),
+                )
 
             if args.show_fps:
                 fps_text = f"FPS: {fps_smoother:.1f}"

@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
@@ -128,7 +128,12 @@ def frame_generator():
 INDEX_HTML = """
 <!doctype html>
 <title>AI Track App</title>
-<style>body{font-family:system-ui;margin:0;background:#111;color:#eee}header{padding:12px 16px;background:#1b1b1b;border-bottom:1px solid #222}main{padding:12px}img{max-width:100%;height:auto;border:1px solid #222}</style>
+<style>
+  body{font-family:system-ui;margin:0;background:#111;color:#eee}
+  header{padding:12px 16px;background:#1b1b1b;border-bottom:1px solid #222}
+  main{padding:12px}
+  img{max-width:100%;height:auto;border:1px solid #222}
+</style>
 <header>
   <h3>AI Track App (Render Free)</h3>
   <div>Streaming from RTSP_URL</div>
