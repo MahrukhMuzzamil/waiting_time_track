@@ -1,0 +1,11 @@
+line-length = 120
+extend-exclude = [".venv", "venv", "**/.venv/**", "**/venv/**"]
+
+[format]
+quote-style = "preserve"
+indent-style = "space"
+line-ending = "auto"
+
+[lint]
+select = ["E", "F", "W"]
+ignore = []
