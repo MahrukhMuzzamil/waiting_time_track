@@ -22,7 +22,5 @@ def main() -> int:
     print(f"opened= True, first_read= {ret}")
     return 0 if ret else 1
 
-
 if __name__ == "__main__":
     raise SystemExit(main())
-
