@@ -1,4 +1,6 @@
 import argparse
+import os
+import json
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -6,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
+from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from ultralytics import YOLO
 import torch
 import torchvision.transforms as T
@@ -243,27 +246,158 @@ def draw_label_with_background(
     cv2.putText(frame, text, (x + padding, y - padding), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness, cv2.LINE_AA)
 
 
+def generate_rtsp_candidates(rtsp_url: str) -> List[str]:
+    parsed = urlparse(rtsp_url)
+    if parsed.scheme.lower() != "rtsp":
+        return [rtsp_url]
+
+    candidates: List[str] = []
+
+    def with_path_and_query(path: str, extra_q: Dict[str, str] | None = None) -> str:
+        qs = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        if extra_q:
+            qs.update(extra_q)
+        new_q = urlencode(qs)
+        new_parts = (
+            parsed.scheme,
+            parsed.netloc,
+            path,
+            parsed.params,
+            new_q,
+            parsed.fragment,
+        )
+        return urlunparse(new_parts)
+
+    # Always include the original and the original with transportmode=unicast
+    candidates.append(rtsp_url)
+    if "transportmode=" not in parsed.query:
+        candidates.append(with_path_and_query(parsed.path, {"transportmode": "unicast"}))
+
+    # Add trailing-slash variants
+    if not parsed.path.endswith("/"):
+        candidates.append(with_path_and_query(parsed.path + "/"))
+        candidates.append(with_path_and_query(parsed.path + "/", {"transportmode": "unicast"}))
+
+    path = parsed.path or "/"
+
+    def add_unique(url: str) -> None:
+        if url not in candidates:
+            candidates.append(url)
+
+    # Normalize Channels vs channels
+    if "/Streaming/Channels/" in path and "/Streaming/channels/" not in path:
+        add_unique(with_path_and_query(path.replace("/Streaming/Channels/", "/Streaming/channels/")))
+
+    # If Hikvision Channels pattern, try common main/sub and NVR mappings
+    if "/Streaming/Channels/" in path or "/Streaming/channels/" in path:
+        # Try a small set of common channel mappings (1..4), main (01) and sub (02)
+        for cam_idx in (1, 2, 3, 4):
+            for stream_suffix in (1, 2):
+                chan = f"{cam_idx}0{stream_suffix}"
+                for base in ("/Streaming/Channels/", "/Streaming/channels/"):
+                    add_unique(with_path_and_query(f"{base}{chan}"))
+                    add_unique(with_path_and_query(f"{base}{chan}", {"transportmode": "unicast"}))
+
+    # ISAPI variant
+    for cam_idx in (1, 2, 3, 4):
+        for stream_suffix in (1, 2):
+            chan = f"{cam_idx}0{stream_suffix}"
+            add_unique(with_path_and_query(f"/ISAPI/Streaming/channels/{chan}"))
+            add_unique(with_path_and_query(f"/ISAPI/Streaming/channels/{chan}", {"transportmode": "unicast"}))
+
+    # Legacy paths used by some Hikvision firmwares
+    add_unique(with_path_and_query("/h264/ch1/main/av_stream"))
+    add_unique(with_path_and_query("/h264/ch1/sub/av_stream"))
+
+    # Dahua-style paths (some OEMs too)
+    for cam_idx in (1, 2, 3, 4):
+        for subtype in (0, 1):  # 0 main, 1 sub
+            add_unique(with_path_and_query(f"/cam/realmonitor", {"channel": str(cam_idx), "subtype": str(subtype)}))
+
+    # Uniview-like variants
+    for cam_idx in (1, 2, 3, 4):
+        for subtype in (0, 1):
+            add_unique(with_path_and_query(f"/live/ch{cam_idx}0{subtype}"))
+            add_unique(with_path_and_query(f"/live", {"channel": f"{cam_idx}", "subtype": f"{subtype}"}))
+
+    return candidates
+
+
+def open_rtsp_with_fallbacks(rtsp_url: str, on_success: Optional[callable] = None) -> Optional[cv2.VideoCapture]:
+    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000|max_delay;5000000"
+    for candidate in generate_rtsp_candidates(rtsp_url):
+        print(f"[RTSP] Trying: {candidate}")
+        cap_try = cv2.VideoCapture(candidate, cv2.CAP_FFMPEG)
+        if cap_try.isOpened():
+            ok, _ = cap_try.read()
+            if ok:
+                print(f"[RTSP] Using: {candidate}")
+                if on_success is not None:
+                    try:
+                        on_success(candidate)
+                    except Exception:
+                        pass
+                return cap_try
+            cap_try.release()
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Realtime waiting-time overlay prototype (webcam)")
-    parser.add_argument("--source", type=str, default="0", help="Camera index or video path. '0' for default webcam")
+    parser.add_argument("--source", type=str, default="auto", help="Camera index, video path, RTSP url, or 'auto' to load saved RTSP")
     parser.add_argument("--conf", type=float, default=0.4, help="Confidence threshold for person detections")
     parser.add_argument("--max-missing", type=int, default=30, help="Frames to keep track alive without detection")
     parser.add_argument("--iou", type=float, default=0.3, help="IoU threshold to match detections to tracks")
     parser.add_argument("--show-fps", action="store_true", help="Overlay FPS counter")
+    parser.add_argument("--no-window", action="store_true", help="Run without display window (for autostart)")
     parser.add_argument("--reid", action="store_true", help="Enable ReID to persist identity across occlusions")
     parser.add_argument("--reid-sim", type=float, default=0.62, help="Cosine similarity threshold for ReID match")
     args = parser.parse_args()
 
+    # Config helpers for persisting RTSP
+    CONFIG_PATH = os.path.join(os.path.dirname(__file__), "config.json")
+
+    def load_saved_rtsp() -> Optional[str]:
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            url = data.get("rtsp_url")
+            if isinstance(url, str) and url.startswith("rtsp://"):
+                return url
+        except Exception:
+            pass
+        return None
+
+    def save_working_rtsp(url: str) -> None:
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump({"rtsp_url": url}, f, indent=2)
+        except Exception:
+            pass
+
     # Resolve source
     source: Optional[int | str]
-    if args.source.isdigit():
+    src_arg = (args.source or "").strip().lower()
+    if src_arg == "auto" or src_arg == "":
+        saved = load_saved_rtsp()
+        if saved:
+            source = saved
+            print(f"[CONFIG] Loaded saved RTSP from config.json")
+        else:
+            raise RuntimeError("No saved RTSP found in config.json. Provide --source <rtsp-url> once to save it.")
+    elif args.source.isdigit():
         source = int(args.source)
     else:
         source = args.source
 
     model = YOLO("yolov8n.pt")  # auto-downloads
 
-    cap = cv2.VideoCapture(source)
+    if isinstance(source, str) and source.startswith("rtsp://"):
+        cap = open_rtsp_with_fallbacks(source, on_success=save_working_rtsp)
+        if cap is None:
+            raise RuntimeError(f"Unable to open RTSP source after fallbacks. Last tried: {source}")
+    else:
+        cap = cv2.VideoCapture(source)
     if not cap.isOpened():
         raise RuntimeError(f"Unable to open video source: {source}")
 
@@ -277,7 +411,8 @@ def main() -> None:
 
     frame_idx = 0
     window_name = "Clinic Wait-Time Prototype"
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    if not args.no_window:
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     try:
         while True:
@@ -354,10 +489,11 @@ def main() -> None:
                 fps_text = f"FPS: {fps_smoother:.1f}"
                 cv2.putText(frame, fps_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
-            cv2.imshow(window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                break
+            if not args.no_window:
+                cv2.imshow(window_name, frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    break
 
             frame_idx += 1
     finally:

@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: ai-track-app
+    plan: free
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn server:app -w 1 -k gthread --threads 1 --timeout 120 --bind 0.0.0.0:$PORT
+    envVars:
+      - key: RTSP_URL
+        value: ""
+      - key: CONF_THRESHOLD
+        value: "0.4"
+      - key: REID
+        value: "1"
+      - key: REID_SIM
+        value: "0.62"
+
