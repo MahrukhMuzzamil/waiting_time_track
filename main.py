@@ -10,8 +10,6 @@ import numpy as np
 from urllib.parse import urlparse, urlunparse, urlencode, parse_qsl
 from ultralytics import YOLO
 import torch
-import torchvision.transforms as T
-from torchvision.models import resnet18, ResNet18_Weights
 
 
 @dataclass
@@ -150,6 +148,14 @@ class ReIDMemory:
     """
 
     def __init__(self, similarity_threshold: float = 0.62, ttl_seconds: float = 600.0) -> None:
+        # Lazy-import torchvision to avoid making it a hard runtime dependency
+        try:
+            import torchvision.transforms as T  # type: ignore
+            from torchvision.models import resnet18, ResNet18_Weights  # type: ignore
+        except Exception as exc:  # pragma: no cover - informative error for runtime
+            raise RuntimeError(
+                "Torchvision is required for ReID. Install torchvision or run without --reid/REID=0."
+            ) from exc
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         weights = ResNet18_Weights.DEFAULT
         backbone = resnet18(weights=weights)
