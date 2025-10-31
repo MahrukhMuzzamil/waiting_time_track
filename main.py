@@ -246,7 +246,16 @@ def draw_label_with_background(
     x, y = org
     # Background rectangle above the head (y is top of bbox); shift up by baseline
     cv2.rectangle(frame, (x, y - th - 2 * padding), (x + tw + 2 * padding, y), bg_color, cv2.FILLED)
-    cv2.putText(frame, text, (x + padding, y - padding), cv2.FONT_HERSHEY_SIMPLEX, font_scale, text_color, thickness, cv2.LINE_AA)
+    cv2.putText(
+        frame,
+        text,
+        (x + padding, y - padding),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        text_color,
+        thickness,
+        cv2.LINE_AA,
+    )
 
 
 def generate_rtsp_candidates(rtsp_url: str) -> List[str]:
