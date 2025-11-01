@@ -40,7 +40,7 @@ REID_SIM = float(os.environ.get("REID_SIM", "0.62"))
 
 
 # Global state
-model = YOLO("yolov8n.pt")  # CPU on Render free tier
+_yolo_model: Optional[YOLO] = None  # lazy-loaded when needed
 tracker = IoUTracker(max_missing_frames=30, iou_match_threshold=0.3)
 reid_memory: Optional[ReIDMemory] = ReIDMemory(similarity_threshold=REID_SIM) if REID_ENABLED else None
 
@@ -56,6 +56,58 @@ def open_capture() -> cv2.VideoCapture:
         raise RuntimeError("Unable to open RTSP source from RTSP_URL")
     return cap
 
+
+def _get_model() -> YOLO:
+    global _yolo_model
+    if _yolo_model is None:
+        _yolo_model = YOLO("yolov8n.pt")
+    return _yolo_model
+
+
+def frame_generator_raw():
+    cap = None
+    last = time.time()
+    target_interval = 1.0 / 8.0
+
+    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _placeholder_frame("Connecting…") + b"\r\n")
+
+    while True:
+        try:
+            if cap is None:
+                cap = open_capture()
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = None
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _placeholder_frame("Reconnecting…") + b"\r\n")
+                time.sleep(0.8)
+                continue
+
+            h, w = frame.shape[:2]
+            if w > 640:
+                nh = int(h * 640 / w)
+                frame = cv2.resize(frame, (640, nh), interpolation=cv2.INTER_AREA)
+
+            jpg = _encode_jpeg(frame) or _placeholder_frame("Encoding…")
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+
+            now = time.time()
+            dt = now - last
+            if dt < target_interval:
+                time.sleep(target_interval - dt)
+            last = time.time()
+        except Exception:
+            if cap is not None:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+                cap = None
+            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _placeholder_frame("Error…") + b"\r\n")
+            time.sleep(0.8)
 
 def _encode_jpeg(img: np.ndarray) -> Optional[bytes]:
     ok, buff = cv2.imencode('.jpg', img)
@@ -118,7 +170,7 @@ def frame_generator():
                 frame_infer = frame
 
             with torch.no_grad():
-                results = model.predict(
+                results = _get_model().predict(
                     source=frame_infer,
                     imgsz=480,
                     conf=CONF_THRESHOLD,
@@ -225,7 +277,7 @@ def index():
 @app.get("/video")
 def video():
     resp = Response(
-        stream_with_context(frame_generator()),
+        stream_with_context(frame_generator_raw()),
         mimetype='multipart/x-mixed-replace; boundary=frame',
     )
     # Proxy/CDN friendly headers for long‑lived MJPEG streams
@@ -234,6 +286,20 @@ def video():
     resp.headers["Expires"] = "0"
     resp.headers["Connection"] = "keep-alive"
     # Some proxies honor this to disable buffering; harmless elsewhere
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
+
+
+@app.get("/video_ai")
+def video_ai():
+    resp = Response(
+        stream_with_context(frame_generator()),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+    )
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    resp.headers["Connection"] = "keep-alive"
     resp.headers["X-Accel-Buffering"] = "no"
     return resp
 
