@@ -350,11 +350,19 @@ def generate_rtsp_candidates(rtsp_url: str) -> List[str]:
     return candidates
 
 
-def open_rtsp_with_fallbacks(rtsp_url: str, on_success: Optional[callable] = None) -> Optional[cv2.VideoCapture]:
-    os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp|stimeout;5000000|max_delay;5000000"
+    def open_rtsp_with_fallbacks(rtsp_url: str, on_success: Optional[callable] = None) -> Optional[cv2.VideoCapture]:
+        # Respect external overrides if present; otherwise use conservative defaults
+        default_opts = "rtsp_transport;tcp|stimeout;15000000|max_delay;7000000|buffer_size;204800"
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = os.environ.get(
+            "OPENCV_FFMPEG_CAPTURE_OPTIONS", default_opts
+        )
     for candidate in generate_rtsp_candidates(rtsp_url):
         print(f"[RTSP] Trying: {candidate}")
         cap_try = cv2.VideoCapture(candidate, cv2.CAP_FFMPEG)
+            try:
+                cap_try.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
         if cap_try.isOpened():
             ok, _ = cap_try.read()
             if ok:
