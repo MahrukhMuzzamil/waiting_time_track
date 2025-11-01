@@ -4,7 +4,7 @@ extend-exclude = [".venv", "venv", "**/.venv/**", "**/venv/**"]
 [format]
 quote-style = "preserve"
 indent-style = "space"
-line-ending = "auto"
+line-ending = "lf"
 
 [lint]
 select = ["E", "F", "W"]
