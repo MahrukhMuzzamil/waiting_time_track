@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, render_template_string, stream_with_context
+from flask import Flask, Response, render_template_string, stream_with_context, make_response
 from ultralytics import YOLO
 import torch
 
@@ -43,6 +43,9 @@ REID_SIM = float(os.environ.get("REID_SIM", "0.62"))
 model = YOLO("yolov8n.pt")  # CPU on Render free tier
 tracker = IoUTracker(max_missing_frames=30, iou_match_threshold=0.3)
 reid_memory: Optional[ReIDMemory] = ReIDMemory(similarity_threshold=REID_SIM) if REID_ENABLED else None
+
+# Shared capture for lightweight snapshot endpoint
+_snap_cap: Optional[cv2.VideoCapture] = None
 
 
 def open_capture() -> cv2.VideoCapture:
@@ -197,10 +200,19 @@ INDEX_HTML = """
   <h3>AI Track App (Render Free)</h3>
   <div>Streaming from RTSP_URL</div>
   <small>CPU only. Expect low FPS on free tier.</small>
-  <div><a href="/video">/video</a></div>
+  <div><a href="/video">/video</a> · <a href="/snapshot">/snapshot</a></div>
   </header>
 <main>
-  <img src="/video" alt="stream">
+  <div>
+    <img id="snap" src="/snapshot" alt="snapshot">
+  </div>
+  <script>
+    const img = document.getElementById('snap');
+    setInterval(() => {
+      const ts = Date.now();
+      img.src = '/snapshot?ts=' + ts;
+    }, 1000);
+  </script>
 </main>
 """
 
@@ -223,6 +235,34 @@ def video():
     resp.headers["Connection"] = "keep-alive"
     # Some proxies honor this to disable buffering; harmless elsewhere
     resp.headers["X-Accel-Buffering"] = "no"
+    return resp
+
+
+@app.get("/snapshot")
+def snapshot():
+    global _snap_cap
+    try:
+        if _snap_cap is None or not _snap_cap.isOpened():
+            _snap_cap = open_capture()
+
+        ok, frame = _snap_cap.read()
+        if not ok or frame is None:
+            try:
+                _snap_cap.release()
+            except Exception:
+                pass
+            _snap_cap = None
+            data = _placeholder_frame("Reconnecting…")
+        else:
+            data = _encode_jpeg(frame) or _placeholder_frame("Encoding…")
+    except Exception:
+        data = _placeholder_frame("Error…")
+
+    resp = make_response(data)
+    resp.headers['Content-Type'] = 'image/jpeg'
+    resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
+    resp.headers['Pragma'] = 'no-cache'
+    resp.headers['Expires'] = '0'
     return resp
 
 
