@@ -83,9 +83,15 @@ def frame_generator():
 
             ret, frame = cap.read()
             if not ret or frame is None:
-                # reconnect
-                cap.release()
+                # reconnect, but keep client alive with a placeholder frame
+                try:
+                    cap.release()
+                except Exception:
+                    pass
                 cap = None
+                keepalive = _placeholder_frame("Reconnecting…")
+                if keepalive:
+                    yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + keepalive + b"\r\n")
                 time.sleep(1.0)
                 continue
 
@@ -206,10 +212,18 @@ def index():
 
 @app.get("/video")
 def video():
-    return Response(
+    resp = Response(
         stream_with_context(frame_generator()),
         mimetype='multipart/x-mixed-replace; boundary=frame',
     )
+    # Proxy/CDN friendly headers for long‑lived MJPEG streams
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    resp.headers["Connection"] = "keep-alive"
+    # Some proxies honor this to disable buffering; harmless elsewhere
+    resp.headers["X-Accel-Buffering"] = "no"
+    return resp
 
 
 if __name__ == "__main__":
