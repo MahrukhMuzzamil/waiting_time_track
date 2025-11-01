@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 
 import cv2
 import numpy as np
-from flask import Flask, Response, render_template_string
+from flask import Flask, Response, render_template_string, stream_with_context
 from ultralytics import YOLO
 import torch
 
@@ -54,10 +54,27 @@ def open_capture() -> cv2.VideoCapture:
     return cap
 
 
+def _encode_jpeg(img: np.ndarray) -> Optional[bytes]:
+    ok, buff = cv2.imencode('.jpg', img)
+    return buff.tobytes() if ok else None
+
+
+def _placeholder_frame(text: str = "Starting…") -> bytes:
+    canvas = np.full((360, 640, 3), 245, dtype=np.uint8)
+    cv2.putText(canvas, text, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 0, 0), 2, cv2.LINE_AA)
+    data = _encode_jpeg(canvas)
+    return data or b""
+
+
 def frame_generator():
     cap = None
     fps_smoother = None
     last_time = time.time()
+
+    # Send a quick placeholder so client receives 200 immediately
+    first = _placeholder_frame("Connecting to camera…")
+    if first:
+        yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + first + b"\r\n")
 
     while True:
         try:
@@ -94,7 +111,7 @@ def frame_generator():
             with torch.no_grad():
                 results = model.predict(
                     source=frame_infer,
-                    imgsz=640,
+                    imgsz=480,
                     conf=CONF_THRESHOLD,
                     classes=[0],
                     verbose=False,
@@ -139,13 +156,14 @@ def frame_generator():
             cv2.putText(frame, fps_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
 
             # Encode JPEG
-            ok, buff = cv2.imencode('.jpg', frame)
-            if not ok:
-                continue
-            jpg = buff.tobytes()
-            yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+            jpg = _encode_jpeg(frame)
+            if jpg is not None:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n")
+            else:
+                keepalive = _placeholder_frame("Encoding error…")
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + keepalive + b"\r\n")
 
-        except Exception:
+        except BaseException:
             # Backoff on errors
             if cap is not None:
                 try:
@@ -153,6 +171,10 @@ def frame_generator():
                 except Exception:
                     pass
                 cap = None
+            # keep the stream alive with a placeholder frame
+            keepalive = _placeholder_frame("Reconnecting…")
+            if keepalive:
+                yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + keepalive + b"\r\n")
             time.sleep(1.0)
 
 
@@ -184,7 +206,10 @@ def index():
 
 @app.get("/video")
 def video():
-    return Response(frame_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        stream_with_context(frame_generator()),
+        mimetype='multipart/x-mixed-replace; boundary=frame',
+    )
 
 
 if __name__ == "__main__":
