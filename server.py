@@ -109,6 +109,7 @@ def frame_generator_raw():
             yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + _placeholder_frame("Error…") + b"\r\n")
             time.sleep(0.8)
 
+
 def _encode_jpeg(img: np.ndarray) -> Optional[bytes]:
     ok, buff = cv2.imencode('.jpg', img)
     return buff.tobytes() if ok else None
