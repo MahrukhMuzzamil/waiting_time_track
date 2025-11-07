@@ -62,3 +62,40 @@ PowerShell -ExecutionPolicy Bypass -File scripts\register_autostart.ps1 -TaskNam
 ```powershell
 Unregister-ScheduledTask -TaskName ClinicWaitTimeApp -Confirm:$false
 ```
+
+## Guard Console (Local Deployment)
+Run the vision stack on the guard’s PC so the stream stays on-prem and starts automatically.
+
+1. Ensure `config.json` contains the camera RTSP url (`rtsp_url`) or pass `-RtspUrl` on the command.
+2. Create the virtual environment and install dependencies (see setup above).
+3. Launch the guard dashboard manually:
+   ```powershell
+   PowerShell -ExecutionPolicy Bypass -File scripts\start_guard_console.ps1 -RtspUrl "rtsp://user:pass@CAM_IP:554/..."
+   ```
+   The script boots `server.py` in a minimized PowerShell window and opens `http://localhost:8000/video_ai` in the default browser.
+   - For a double-click experience, create a desktop shortcut that points to `scripts\launch_guard_console.bat`. Once the RTSP URL is saved in `config.json`, the guard only needs to open that shortcut.
+4. Optional: register a scheduled task that starts the dashboard at logon (runs kiosk-style):
+   ```powershell
+   $project = "C:\Users\Guard\Desktop\ai_track_app"
+   PowerShell -ExecutionPolicy Bypass -File "$project\scripts\register_autostart.ps1" `
+     -TaskName GuardConsole `
+     -Executable powershell.exe `
+     -Arguments "-NoProfile -ExecutionPolicy Bypass -File `"$project\scripts\start_guard_console.ps1`""
+   ```
+5. To remove the scheduled task later:
+   ```powershell
+   Unregister-ScheduledTask -TaskName GuardConsole -Confirm:$false
+   ```
+
+## Deploying to Render
+If you want the stream accessible off-site, deploy the Flask app to Render.
+
+1. Push the repo to GitHub/GitLab and connect it to a new Render Web Service.
+2. Choose the **Starter** plan (the free tier sleeps and doesn’t have enough CPU/RAM for the model load).
+3. During setup:
+   - Set `Build Command` to the value already defined in `render.yaml` (`pip install --upgrade pip && pip install -r requirements.txt`).
+   - Set `Start Command` to `./scripts/render_start.sh`.
+   - Add a secret environment variable `RTSP_URL` with the camera address.
+   - Leave `REID` unset (defaults to `0` on Render to reduce load).
+4. After the first deploy finishes, hit the `/snapshot` endpoint to confirm the camera connection, then switch to `/video_ai` for the annotated stream. Render proxies support the MJPEG feed used by the dashboard.
+5. Keep an eye on the service metrics; if CPU stays pegged, consider moving to a larger instance or enabling ReID only on beefier hardware.

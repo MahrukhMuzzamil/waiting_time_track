@@ -1,17 +1,20 @@
 services:
   - type: web
     name: ai-track-app
-    plan: free
+    plan: starter
+    region: oregon
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn server:app -w 1 -k gthread --threads 1 --timeout 120 --bind 0.0.0.0:$PORT
+    autoDeploy: false
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: ./scripts/render_start.sh
+    healthCheckPath: /snapshot
     envVars:
       - key: RTSP_URL
-        value: ""
+        sync: false
       - key: CONF_THRESHOLD
         value: "0.4"
       - key: REID
-        value: "1"
+        value: "0"
       - key: REID_SIM
         value: "0.62"
 
