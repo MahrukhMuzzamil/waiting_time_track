@@ -190,7 +190,6 @@ def frame_generator():
                     classes=[0],
                     verbose=False,
                     device="cpu",
-                    fuse=False,  # avoid Conv+BN fusion to reduce memory spikes
                 )
 
             boxes_xyxy: List[np.ndarray] = []
