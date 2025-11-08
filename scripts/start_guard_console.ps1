@@ -7,6 +7,29 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+function Get-FreeTcpPort {
+    param(
+        [int]$Preferred,
+        [int]$MaxAttempts = 50
+    )
+
+    $props = [System.Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties()
+    $inUse = $props.GetActiveTcpListeners() | ForEach-Object { $_.Port }
+
+    if ($inUse -notcontains $Preferred) {
+        return $Preferred
+    }
+
+    for ($i = 1; $i -le $MaxAttempts; $i++) {
+        $candidate = $Preferred + $i
+        if ($inUse -notcontains $candidate) {
+            return $candidate
+        }
+    }
+
+    return $null
+}
+
 $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $projectRoot = Split-Path -Parent $scriptRoot
 $configPath = Join-Path $projectRoot 'config.json'
@@ -31,6 +54,15 @@ if ([string]::IsNullOrWhiteSpace($RtspUrl)) {
 $venvActivate = Join-Path $projectRoot '.venv\Scripts\Activate.ps1'
 if (!(Test-Path $venvActivate)) {
     throw "Virtual environment not found. Run 'python -m venv .venv' and install requirements first."
+}
+
+$selectedPort = Get-FreeTcpPort -Preferred $Port
+if (-not $selectedPort) {
+    throw "Unable to find a free TCP port near $Port. Specify -Port to override."
+}
+if ($selectedPort -ne $Port) {
+    Write-Warning "Port $Port is in use. Switching to $selectedPort."
+    $Port = $selectedPort
 }
 
 $serverScript = @"

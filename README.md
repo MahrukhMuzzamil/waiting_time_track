@@ -73,6 +73,7 @@ Run the vision stack on the guard’s PC so the stream stays on-prem and starts 
    PowerShell -ExecutionPolicy Bypass -File scripts\start_guard_console.ps1 -RtspUrl "rtsp://user:pass@CAM_IP:554/..."
    ```
    The script boots `server.py` in a minimized PowerShell window and opens `http://localhost:8000/video_ai` in the default browser.
+   - If port 8000 is already in use, the script automatically selects the next available port (you will see the chosen port in the console window); override manually with `-Port 9000` if needed.
    - For a double-click experience, create a desktop shortcut that points to `scripts\launch_guard_console.bat`. Once the RTSP URL is saved in `config.json`, the guard only needs to open that shortcut.
 4. Optional: register a scheduled task that starts the dashboard at logon (runs kiosk-style):
    ```powershell

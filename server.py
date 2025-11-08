@@ -1,5 +1,7 @@
+import logging
 import os
 import time
+import traceback
 from typing import Dict, List, Optional
 
 import cv2
@@ -16,6 +18,12 @@ from main import (
     open_rtsp_with_fallbacks,
 )
 
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -51,6 +59,7 @@ _snap_cap: Optional[cv2.VideoCapture] = None
 def open_capture() -> cv2.VideoCapture:
     if not RTSP_URL or not RTSP_URL.startswith("rtsp://"):
         raise RuntimeError("RTSP_URL env var is required and must start with rtsp://")
+    logger.info("Opening RTSP capture for %s", RTSP_URL)
     cap = open_rtsp_with_fallbacks(RTSP_URL)
     if cap is None:
         raise RuntimeError("Unable to open RTSP source from RTSP_URL")
@@ -74,6 +83,7 @@ def frame_generator_raw():
     while True:
         try:
             if cap is None:
+                logger.info("frame_generator_raw acquiring capture")
                 cap = open_capture()
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -100,6 +110,7 @@ def frame_generator_raw():
                 time.sleep(target_interval - dt)
             last = time.time()
         except Exception:
+            logger.exception("frame_generator_raw loop error")
             if cap is not None:
                 try:
                     cap.release()
@@ -135,6 +146,7 @@ def frame_generator():
     while True:
         try:
             if cap is None:
+                logger.info("frame_generator acquiring capture")
                 cap = open_capture()
 
             ret, frame = cap.read()
@@ -161,6 +173,7 @@ def frame_generator():
 
             # YOLO inference for persons (reduced memory)
             # Downscale frame slightly to reduce memory/CPU
+            infer_start = time.time()
             ih, iw = frame.shape[:2]
             scale = 640 / max(iw, ih)
             if scale < 1.0:
@@ -225,7 +238,14 @@ def frame_generator():
                 keepalive = _placeholder_frame("Encoding error…")
                 yield (b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + keepalive + b"\r\n")
 
+            logger.debug(
+                "frame_generator iteration completed in %.2fs (fps_smoother=%.2f)",
+                time.time() - infer_start,
+                fps_smoother or 0.0,
+            )
+
         except BaseException:
+            logger.exception("frame_generator loop error")
             # Backoff on errors
             if cap is not None:
                 try:
