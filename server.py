@@ -50,7 +50,10 @@ REID_SIM = float(os.environ.get("REID_SIM", "0.62"))
 _yolo_model: Optional[YOLO] = None  # lazy-loaded when needed
 tracker = IoUTracker(max_missing_frames=30, iou_match_threshold=0.3)
 reid_memory: Optional[ReIDMemory] = ReIDMemory(similarity_threshold=REID_SIM) if REID_ENABLED else None
-# person_id -> earliest start time (ReID-aware)
+track_to_label: Dict[int, int] = {}
+reid_to_label: Dict[int, int] = {}
+next_label_id: int = 1
+# person_id -> earliest start time (ReID-aware or tracker-based)
 person_start_times: Dict[int, float] = {}
 person_last_seen: Dict[int, float] = {}
 
@@ -138,6 +141,7 @@ def _placeholder_frame(text: str = "Starting…") -> bytes:
 
 
 def frame_generator():
+    global next_label_id
     cap = None
     fps_smoother = None
     last_time = time.time()
@@ -216,6 +220,8 @@ def frame_generator():
 
             frame_idx += 1
             tracked: Dict[int, np.ndarray] = tracker.step(frame_idx, detections, now_s)
+            active_labels = {label for tid_active, label in track_to_label.items() if tid_active in tracker._tracks}
+            frame_labels: set[int] = set()
 
             for tid, bbox in tracked.items():
                 x1, y1, x2, y2 = bbox.astype(int)
@@ -226,28 +232,45 @@ def frame_generator():
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
 
+                label_id = track_to_label.get(tid)
+                reid_id: Optional[int] = None
                 if reid_memory is not None:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0 and crop.shape[0] > 10 and crop.shape[1] > 10:
-                        person_id = reid_memory.assign_person_id(crop, now_s)
-                    else:
-                        person_id = tid
-                else:
-                    person_id = tid
+                        reid_id = reid_memory.assign_person_id(crop, now_s)
 
-                # Keep earliest sighting per person ID
-                if person_id not in person_start_times:
+                candidate_label: Optional[int] = None
+                if label_id is None and reid_id is not None:
+                    candidate = reid_to_label.get(reid_id)
+                    if candidate is not None and candidate not in active_labels and candidate not in frame_labels:
+                        candidate_label = candidate
+
+                if label_id is None:
+                    if candidate_label is not None:
+                        label_id = candidate_label
+                    else:
+                        label_id = next_label_id
+                        next_label_id += 1
+                    track_to_label[tid] = label_id
+
+                if reid_id is not None:
+                    reid_to_label[reid_id] = label_id
+
+                frame_labels.add(label_id)
+                active_labels.add(label_id)
+
+                if label_id not in person_start_times:
                     start_time_s = tracker.get_track_start_time(tid) or now_s
-                    person_start_times[person_id] = start_time_s
-                start_time_s = person_start_times[person_id]
+                    person_start_times[label_id] = start_time_s
+                start_time_s = person_start_times[label_id]
                 wait_s = now_s - start_time_s
-                time_text = f"ID {person_id} · {format_hms(wait_s)}"
-                person_last_seen[person_id] = now_s
+                time_text = f"ID {label_id} · {format_hms(wait_s)}"
+                person_last_seen[label_id] = now_s
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         "Track tid=%d assigned person_id=%d bbox=(%d,%d,%d,%d) wait=%.1fs",
                         tid,
-                        person_id,
+                        label_id,
                         x1,
                         y1,
                         x2,
@@ -282,6 +305,11 @@ def frame_generator():
             for pid in stale_ids:
                 person_last_seen.pop(pid, None)
                 person_start_times.pop(pid, None)
+
+            current_tids = set(tracker._tracks.keys())
+            for tid_old in list(track_to_label.keys()):
+                if tid_old not in current_tids:
+                    track_to_label.pop(tid_old, None)
 
         except BaseException:
             logger.exception("frame_generator loop error")
