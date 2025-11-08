@@ -179,8 +179,12 @@ def frame_generator():
                 new_w = max(320, int(iw * scale))
                 new_h = max(240, int(ih * scale))
                 frame_infer = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                ratio_x = iw / new_w
+                ratio_y = ih / new_h
             else:
                 frame_infer = frame
+                ratio_x = 1.0
+                ratio_y = 1.0
 
             with torch.no_grad():
                 results = _get_model().predict(
@@ -200,6 +204,10 @@ def frame_generator():
                     boxes_xyxy = [bb for bb in b]
 
             detections = np.array(boxes_xyxy, dtype=np.float32) if boxes_xyxy else np.zeros((0, 4), dtype=np.float32)
+            if detections.size > 0 and (ratio_x != 1.0 or ratio_y != 1.0):
+                detections[:, [0, 2]] *= ratio_x
+                detections[:, [1, 3]] *= ratio_y
+
             tracked: Dict[int, np.ndarray] = tracker.step(int(now_s * 1000) % 1_000_000, detections, now_s)
 
             for tid, bbox in tracked.items():
