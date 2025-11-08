@@ -136,6 +136,7 @@ def frame_generator():
     cap = None
     fps_smoother = None
     last_time = time.time()
+    frame_idx = 0
 
     # Send a quick placeholder so client receives 200 immediately
     first = _placeholder_frame("Connecting to camera…")
@@ -208,7 +209,8 @@ def frame_generator():
                 detections[:, [0, 2]] *= ratio_x
                 detections[:, [1, 3]] *= ratio_y
 
-            tracked: Dict[int, np.ndarray] = tracker.step(int(now_s * 1000) % 1_000_000, detections, now_s)
+            frame_idx += 1
+            tracked: Dict[int, np.ndarray] = tracker.step(frame_idx, detections, now_s)
 
             for tid, bbox in tracked.items():
                 x1, y1, x2, y2 = bbox.astype(int)
