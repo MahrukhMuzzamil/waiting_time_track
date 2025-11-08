@@ -50,6 +50,11 @@ REID_SIM = float(os.environ.get("REID_SIM", "0.62"))
 _yolo_model: Optional[YOLO] = None  # lazy-loaded when needed
 tracker = IoUTracker(max_missing_frames=30, iou_match_threshold=0.3)
 reid_memory: Optional[ReIDMemory] = ReIDMemory(similarity_threshold=REID_SIM) if REID_ENABLED else None
+# person_id -> earliest start time (ReID-aware)
+person_start_times: Dict[int, float] = {}
+person_last_seen: Dict[int, float] = {}
+
+logger.info("ReID enabled: %s", bool(reid_memory))
 
 # Shared capture for lightweight snapshot endpoint
 _snap_cap: Optional[cv2.VideoCapture] = None
@@ -221,15 +226,34 @@ def frame_generator():
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
 
-                label_id = tid
                 if reid_memory is not None:
                     crop = frame[y1:y2, x1:x2]
                     if crop.size > 0 and crop.shape[0] > 10 and crop.shape[1] > 10:
-                        label_id = reid_memory.assign_person_id(crop, now_s)
+                        person_id = reid_memory.assign_person_id(crop, now_s)
+                    else:
+                        person_id = tid
+                else:
+                    person_id = tid
 
-                start_time_s = tracker.get_track_start_time(tid) or now_s
+                # Keep earliest sighting per person ID
+                if person_id not in person_start_times:
+                    start_time_s = tracker.get_track_start_time(tid) or now_s
+                    person_start_times[person_id] = start_time_s
+                start_time_s = person_start_times[person_id]
                 wait_s = now_s - start_time_s
-                time_text = f"ID {label_id} · {format_hms(wait_s)}"
+                time_text = f"ID {person_id} · {format_hms(wait_s)}"
+                person_last_seen[person_id] = now_s
+                if logger.isEnabledFor(logging.DEBUG):
+                    logger.debug(
+                        "Track tid=%d assigned person_id=%d bbox=(%d,%d,%d,%d) wait=%.1fs",
+                        tid,
+                        person_id,
+                        x1,
+                        y1,
+                        x2,
+                        y2,
+                        wait_s,
+                    )
                 label_x = int((x1 + x2) / 2)
                 label_y = max(0, y1 - 6)
                 draw_label_with_background(frame, time_text, (label_x, label_y), font_scale=0.6, bg_color=(50, 50, 50))
@@ -251,6 +275,13 @@ def frame_generator():
                 time.time() - infer_start,
                 fps_smoother or 0.0,
             )
+
+            # Cleanup stale person entries (no update for 5 minutes)
+            stale_cutoff = now_s - 300.0
+            stale_ids = [pid for pid, ts in person_last_seen.items() if ts < stale_cutoff]
+            for pid in stale_ids:
+                person_last_seen.pop(pid, None)
+                person_start_times.pop(pid, None)
 
         except BaseException:
             logger.exception("frame_generator loop error")

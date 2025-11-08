@@ -97,6 +97,6 @@ If you want the stream accessible off-site, deploy the Flask app to Render.
    - Set `Build Command` to the value already defined in `render.yaml` (`pip install --upgrade pip && pip install -r requirements.txt`).
    - Set `Start Command` to `./scripts/render_start.sh`.
    - Add a secret environment variable `RTSP_URL` with the camera address.
-   - Leave `REID` unset (defaults to `0` on Render to reduce load).
+   - Set `REID=1` so the re-identification module keeps unique IDs when people move or overlap. On smaller instances this may lower FPS slightly.
 4. After the first deploy finishes, hit the `/snapshot` endpoint to confirm the camera connection, then switch to `/video_ai` for the annotated stream. Render proxies support the MJPEG feed used by the dashboard.
 5. Keep an eye on the service metrics; if CPU stays pegged, consider moving to a larger instance or enabling ReID only on beefier hardware.

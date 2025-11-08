@@ -14,7 +14,7 @@ services:
       - key: CONF_THRESHOLD
         value: "0.4"
       - key: REID
-        value: "0"
+        value: "1"
       - key: REID_SIM
         value: "0.62"
 
