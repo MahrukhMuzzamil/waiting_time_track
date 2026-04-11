@@ -1,0 +1,18 @@
+[Unit]
+Description=AI Track App - DHA_CAM1 (8182)
+After=network.target
+
+[Service]
+User=aesthetics-lab
+WorkingDirectory=/home/aesthetics-lab/50
+Environment="RTSP_URL=rtsp://admin:GenIT%%407530@154.57.194.109:554/cam/realmonitor?channel=1&subtype=1"
+Environment="CONF_THRESHOLD=0.4"
+Environment="REID=1"
+Environment="REID_SIM=0.62"
+Environment="PATH=/home/aesthetics-lab/50/.venv/bin:/usr/bin"
+ExecStart=/home/aesthetics-lab/50/.venv/bin/gunicorn server:app --workers 1 --threads 2 --timeout 600 --bind 0.0.0.0:8182
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

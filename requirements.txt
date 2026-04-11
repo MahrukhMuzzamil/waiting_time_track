@@ -1,0 +1,16 @@
+# Core runtime
+Flask==3.0.3
+gunicorn==23.0.0
+ultralytics==8.3.27
+opencv-python-headless==4.10.0.84
+numpy==2.1.3
+Pillow==10.4.0
+
+# Torch CPU wheels (PyPI now serves CPU by default on Linux)
+torch==2.6.0
+torchvision==0.21.0
+ultralytics>=8.2.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+torch>=2.2.0
+torchvision>=0.17.0
