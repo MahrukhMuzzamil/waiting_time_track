@@ -336,6 +336,16 @@ class ReIDMemory:
             return best_pid, best_sim
         return None, best_sim
 
+    def score_against_pid(self, crop_bgr: np.ndarray, pid: int) -> float:
+        """Return max cosine similarity between this crop and a specific pid's gallery."""
+        if not self.is_crop_usable(crop_bgr):
+            return -1.0
+        gallery = self.person_id_to_embeddings.get(pid)
+        if not gallery:
+            return -1.0
+        emb = self._extract_embedding(crop_bgr)
+        return self._match_against_gallery(emb, gallery)
+
     def register_new_person(self, crop_bgr: np.ndarray, now_s: float) -> Optional[int]:
         """Create a new person identity from a usable crop. Returns the new pid or None if crop is bad."""
         if not self.is_crop_usable(crop_bgr):
@@ -411,10 +421,12 @@ class PersonRegistry:
         reid: Optional["ReIDMemory"],
         absence_timeout_s: float = 1200.0,  # 20 minutes
         reid_reverify_interval_s: float = 4.0,
+        reid_reverify_margin: float = 0.10,
     ) -> None:
         self.reid = reid
         self.absence_timeout_s = absence_timeout_s
         self.reid_reverify_interval_s = reid_reverify_interval_s
+        self.reid_reverify_margin = reid_reverify_margin
         self._records: Dict[int, PersonRecord] = {}
         self._tid_to_label: Dict[int, int] = {}
         self._pid_to_label: Dict[int, int] = {}  # ReID pid -> label_id
@@ -466,7 +478,13 @@ class PersonRegistry:
         crop: np.ndarray,
         now_s: float,
     ) -> None:
-        """Periodically re-run ReID on an active track to catch tracker swaps."""
+        """
+        Periodically re-run ReID on an active track to catch tracker swaps.
+
+        Guarded by a margin: we only swap this track's label if some other identity
+        scores **significantly** higher than the current one. This prevents ReID noise
+        from overwriting confirmed identities when two people have similar embeddings.
+        """
         if self.reid is None:
             return
         if now_s - record.last_reid_check_s < self.reid_reverify_interval_s:
@@ -474,29 +492,47 @@ class PersonRegistry:
         record.last_reid_check_s = now_s
         if not self.reid.is_crop_usable(crop):
             return
+
+        # How well does this crop match its currently-claimed identity?
+        current_sim = -1.0
+        if record.reid_pid is not None:
+            current_sim = self.reid.score_against_pid(crop, record.reid_pid)
+
         busy_pids = {
             rec.reid_pid for rec in self._records.values()
             if rec.is_visible and rec.reid_pid is not None and rec.label_id != record.label_id
         }
-        pid, _sim = self.reid.match_person_id(crop, now_s, exclude_pids=busy_pids)
-        if pid is None:
-            # Couldn't confirm — just refresh current identity's gallery
-            if record.reid_pid is not None:
-                self.reid.touch_person(record.reid_pid, crop, now_s)
+        # Also exclude our own pid — we want the best OTHER match
+        if record.reid_pid is not None:
+            busy_pids.add(record.reid_pid)
+
+        other_pid, other_sim = self.reid.match_person_id(crop, now_s, exclude_pids=busy_pids)
+
+        # Refresh current identity's gallery regardless — good embedding quality matters
+        if record.reid_pid is not None and self.reid.is_crop_usable(crop):
+            self.reid.touch_person(record.reid_pid, crop, now_s)
+
+        if other_pid is None:
+            return  # No competing match — nothing to do
+
+        # Only swap if the other match is clearly better than staying put
+        if other_sim < current_sim + self.reid_reverify_margin:
             return
-        expected_label = self._pid_to_label.get(pid)
-        if expected_label == record.label_id:
-            # Confirmed; refresh gallery
-            self.reid.touch_person(pid, crop, now_s)
+        # And require the winning similarity to be comfortably above threshold
+        if other_sim < self.reid.similarity_threshold + (self.reid_reverify_margin / 2.0):
             return
-        # Mismatch: tracker likely swapped identities. Rebind this track to the correct label.
+
+        expected_label = self._pid_to_label.get(other_pid)
         if expected_label is None:
-            # ReID found a pid with no label yet (shouldn't happen often) — bind it to current label
-            self._pid_to_label[pid] = record.label_id
-            record.reid_pid = pid
-            self.reid.touch_person(pid, crop, now_s)
+            # ReID has this pid but no label — unusual. Just link it to our current label.
+            self._pid_to_label[other_pid] = record.label_id
+            record.reid_pid = other_pid
+            self.reid.touch_person(other_pid, crop, now_s)
             return
-        # Swap: reassign this tid to the correct label
+        if expected_label == record.label_id:
+            return  # Already pointing at us — no swap needed
+
+        # Genuine identity mismatch: rebind this track to the correct existing label.
         if record.current_tid is not None:
             self._tid_to_label[record.current_tid] = expected_label
             target = self._records.get(expected_label)
@@ -505,7 +541,6 @@ class PersonRegistry:
                 target.is_visible = True
                 target.last_seen_s = now_s
                 target.last_bbox = record.last_bbox
-        # Mark the old record absent
         record.current_tid = None
         record.is_visible = False
 

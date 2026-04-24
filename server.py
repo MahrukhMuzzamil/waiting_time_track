@@ -44,9 +44,9 @@ except Exception:
 
 # Load environment
 RTSP_URL = os.environ.get("RTSP_URL", "").strip()
-CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.4"))
+CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.25"))
 REID_ENABLED = os.environ.get("REID", "1").strip() not in ("0", "false", "False", "")
-REID_SIM = float(os.environ.get("REID_SIM", "0.72"))
+REID_SIM = float(os.environ.get("REID_SIM", "0.78"))
 # Absence window: how long a person's timer is kept alive after they leave the frame.
 # If they return within this window, the timer resumes. Default 20 minutes.
 ABSENCE_TIMEOUT_S = float(os.environ.get("ABSENCE_TIMEOUT_S", "1200"))
@@ -54,9 +54,16 @@ ABSENCE_TIMEOUT_S = float(os.environ.get("ABSENCE_TIMEOUT_S", "1200"))
 # Long-term re-identification is now handled by PersonRegistry+ReID, so this can be short.
 MAX_MISSING_FRAMES = int(os.environ.get("MAX_MISSING_FRAMES", "60"))
 # Reject detections smaller than this area (pixels) — filters noise / distant false positives.
-MIN_DETECTION_AREA = int(os.environ.get("MIN_DETECTION_AREA", "2500"))
+MIN_DETECTION_AREA = int(os.environ.get("MIN_DETECTION_AREA", "1500"))
 # How often to re-run ReID on an established track to catch tracker swaps.
 REID_REVERIFY_INTERVAL_S = float(os.environ.get("REID_REVERIFY_INTERVAL_S", "4.0"))
+# Extra similarity margin required before re-verify swaps a track's label.
+# This prevents ReID noise from rewriting a confirmed identity.
+REID_REVERIFY_MARGIN = float(os.environ.get("REID_REVERIFY_MARGIN", "0.10"))
+# YOLO model path. Use yolov8s.pt or yolov8m.pt for better detection at cost of speed.
+YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt").strip()
+# Inference input size. 640 recommended; raise to 800 for very small/distant people.
+YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
 
 
 # Global state
@@ -76,11 +83,14 @@ registry = PersonRegistry(
     reid=reid_memory,
     absence_timeout_s=ABSENCE_TIMEOUT_S,
     reid_reverify_interval_s=REID_REVERIFY_INTERVAL_S,
+    reid_reverify_margin=REID_REVERIFY_MARGIN,
 )
 
 logger.info(
-    "ReID enabled: %s, sim=%.2f, absence=%.0fs, max_missing=%d, min_area=%d",
-    bool(reid_memory), REID_SIM, ABSENCE_TIMEOUT_S, MAX_MISSING_FRAMES, MIN_DETECTION_AREA,
+    "Config: model=%s imgsz=%d conf=%.2f | ReID=%s sim=%.2f margin=%.2f absence=%.0fs | tracker max_missing=%d min_area=%d",
+    YOLO_MODEL, YOLO_IMGSZ, CONF_THRESHOLD,
+    bool(reid_memory), REID_SIM, REID_REVERIFY_MARGIN, ABSENCE_TIMEOUT_S,
+    MAX_MISSING_FRAMES, MIN_DETECTION_AREA,
 )
 
 # Shared capture for lightweight snapshot endpoint
@@ -150,7 +160,8 @@ def open_capture() -> cv2.VideoCapture:
 def _get_model() -> YOLO:
     global _yolo_model
     if _yolo_model is None:
-        _yolo_model = YOLO("yolov8n.pt")
+        logger.info("Loading YOLO model: %s (imgsz=%d)", YOLO_MODEL, YOLO_IMGSZ)
+        _yolo_model = YOLO(YOLO_MODEL)
     return _yolo_model
 
 
@@ -285,11 +296,11 @@ def frame_generator():
             else:
                 fps_smoother = 0.9 * fps_smoother + 0.1 * (1.0 / max(dt, 1e-6))
 
-            # YOLO inference for persons (reduced memory)
-            # Downscale frame slightly to reduce memory/CPU
+            # YOLO inference for persons. Downscale so the larger dimension matches
+            # YOLO_IMGSZ — this keeps aspect ratio and lets the model see full resolution.
             infer_start = time.time()
             ih, iw = frame.shape[:2]
-            scale = 640 / max(iw, ih)
+            scale = YOLO_IMGSZ / max(iw, ih)
             if scale < 1.0:
                 new_w = max(320, int(iw * scale))
                 new_h = max(240, int(ih * scale))
@@ -304,8 +315,9 @@ def frame_generator():
             with torch.no_grad():
                 results = _get_model().predict(
                     source=frame_infer,
-                    imgsz=480,
+                    imgsz=YOLO_IMGSZ,
                     conf=CONF_THRESHOLD,
+                    iou=0.5,
                     classes=[0],
                     verbose=False,
                     device="cpu",
