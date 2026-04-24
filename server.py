@@ -64,6 +64,11 @@ REID_REVERIFY_MARGIN = float(os.environ.get("REID_REVERIFY_MARGIN", "0.10"))
 YOLO_MODEL = os.environ.get("YOLO_MODEL", "yolov8n.pt").strip()
 # Inference input size. 640 recommended; raise to 800 for very small/distant people.
 YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
+# Use ultralytics' built-in multi-object tracker (ByteTrack/BoT-SORT) instead of the
+# custom IoU tracker. Enabled by default — produces much more stable IDs through occlusions.
+USE_YOLO_TRACK = os.environ.get("USE_YOLO_TRACK", "1").strip() not in ("0", "false", "False", "")
+# Tracker config name — "bytetrack.yaml" (default) or "botsort.yaml".
+YOLO_TRACKER = os.environ.get("YOLO_TRACKER", "bytetrack.yaml").strip()
 
 
 # Global state
@@ -87,8 +92,10 @@ registry = PersonRegistry(
 )
 
 logger.info(
-    "Config: model=%s imgsz=%d conf=%.2f | ReID=%s sim=%.2f margin=%.2f absence=%.0fs | tracker max_missing=%d min_area=%d",
+    "Config: model=%s imgsz=%d conf=%.2f | tracker=%s (yolo_native=%s) | ReID=%s sim=%.2f margin=%.2f absence=%.0fs | legacy_max_missing=%d min_area=%d",
     YOLO_MODEL, YOLO_IMGSZ, CONF_THRESHOLD,
+    YOLO_TRACKER if USE_YOLO_TRACK else "IoU+centroid",
+    USE_YOLO_TRACK,
     bool(reid_memory), REID_SIM, REID_REVERIFY_MARGIN, ABSENCE_TIMEOUT_S,
     MAX_MISSING_FRAMES, MIN_DETECTION_AREA,
 )
@@ -313,35 +320,64 @@ def frame_generator():
                 ratio_y = 1.0
 
             with torch.no_grad():
-                results = _get_model().predict(
-                    source=frame_infer,
-                    imgsz=YOLO_IMGSZ,
-                    conf=CONF_THRESHOLD,
-                    iou=0.5,
-                    classes=[0],
-                    verbose=False,
-                    device="cpu",
-                )
+                if USE_YOLO_TRACK:
+                    # ByteTrack / BoT-SORT inside ultralytics — stable IDs across short occlusions
+                    results = _get_model().track(
+                        source=frame_infer,
+                        imgsz=YOLO_IMGSZ,
+                        conf=CONF_THRESHOLD,
+                        iou=0.5,
+                        classes=[0],
+                        persist=True,
+                        tracker=YOLO_TRACKER,
+                        verbose=False,
+                        device="cpu",
+                    )
+                else:
+                    results = _get_model().predict(
+                        source=frame_infer,
+                        imgsz=YOLO_IMGSZ,
+                        conf=CONF_THRESHOLD,
+                        iou=0.5,
+                        classes=[0],
+                        verbose=False,
+                        device="cpu",
+                    )
 
-            boxes_xyxy: List[np.ndarray] = []
+            # Build tid -> bbox dict. With YOLO tracking: ids come directly from the tracker.
+            # With legacy IoU tracker: extract bboxes and run tracker.step().
+            tracked: Dict[int, np.ndarray] = {}
             if results and len(results) > 0:
                 r0 = results[0]
                 if r0.boxes is not None and len(r0.boxes) > 0:
-                    b = r0.boxes.xyxy.cpu().numpy().astype(np.float32)
-                    boxes_xyxy = [bb for bb in b]
+                    xyxy = r0.boxes.xyxy.cpu().numpy().astype(np.float32)
+                    if ratio_x != 1.0 or ratio_y != 1.0:
+                        xyxy[:, [0, 2]] *= ratio_x
+                        xyxy[:, [1, 3]] *= ratio_y
+                    if MIN_DETECTION_AREA > 0:
+                        areas = (xyxy[:, 2] - xyxy[:, 0]) * (xyxy[:, 3] - xyxy[:, 1])
+                        keep = areas >= MIN_DETECTION_AREA
+                        xyxy = xyxy[keep]
+                        if USE_YOLO_TRACK and r0.boxes.id is not None:
+                            ids = r0.boxes.id.cpu().numpy().astype(int)
+                            ids = ids[keep]
+                        else:
+                            ids = None
+                    elif USE_YOLO_TRACK and r0.boxes.id is not None:
+                        ids = r0.boxes.id.cpu().numpy().astype(int)
+                    else:
+                        ids = None
 
-            detections = np.array(boxes_xyxy, dtype=np.float32) if boxes_xyxy else np.zeros((0, 4), dtype=np.float32)
-            if detections.size > 0 and (ratio_x != 1.0 or ratio_y != 1.0):
-                detections[:, [0, 2]] *= ratio_x
-                detections[:, [1, 3]] *= ratio_y
-
-            # Filter tiny/noise detections — unreliable for both tracking and ReID
-            if detections.size > 0 and MIN_DETECTION_AREA > 0:
-                areas = (detections[:, 2] - detections[:, 0]) * (detections[:, 3] - detections[:, 1])
-                detections = detections[areas >= MIN_DETECTION_AREA]
-
-            frame_idx += 1
-            tracked: Dict[int, np.ndarray] = tracker.step(frame_idx, detections, now_s)
+                    if USE_YOLO_TRACK and ids is not None:
+                        for tid, bbox in zip(ids, xyxy):
+                            tracked[int(tid)] = bbox
+                    else:
+                        # Legacy path — our own IoU tracker assigns ids
+                        frame_idx += 1
+                        tracked = tracker.step(frame_idx, xyxy, now_s)
+            elif not USE_YOLO_TRACK:
+                frame_idx += 1
+                tracked = tracker.step(frame_idx, np.zeros((0, 4), dtype=np.float32), now_s)
 
             # PersonRegistry owns label assignment, ReID, and pause/resume timing
             visible = registry.update(frame, tracked, now_s, dt)

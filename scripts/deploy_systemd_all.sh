@@ -28,10 +28,11 @@ COMMON_ENV=(
     'Environment="YOLO_MODEL=yolov8s.pt"'
     'Environment="YOLO_IMGSZ=640"'
     'Environment="CONF_THRESHOLD=0.25"'
-    'Environment="REID_SIM=0.68"'
+    'Environment="USE_YOLO_TRACK=1"'
+    'Environment="YOLO_TRACKER=bytetrack.yaml"'
+    'Environment="REID_SIM=0.70"'
     'Environment="REID_REVERIFY_MARGIN=0.12"'
     'Environment="MIN_DETECTION_AREA=1500"'
-    'Environment="MAX_MISSING_FRAMES=240"'
     'Environment="ABSENCE_TIMEOUT_S=1200"'
 )
 
