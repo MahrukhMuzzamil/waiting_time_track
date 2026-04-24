@@ -2,7 +2,7 @@ import argparse
 import os
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 import cv2
@@ -23,17 +23,21 @@ class TrackState:
 class IoUTracker:
     def __init__(
         self,
-        max_missing_frames: int = 120,
-        iou_match_threshold: float = 0.15,
-        centroid_fallback_dist: float = 150.0,
+        max_missing_frames: int = 60,
+        iou_match_threshold: float = 0.30,
+        centroid_fallback_dist: float = 120.0,
     ) -> None:
         """
-        IoU-based tracker for short-term person tracking with centroid fallback.
-        
+        IoU-based short-term tracker with centroid fallback.
+
+        Defaults are intentionally stricter than before — identity persistence across
+        longer absences is now handled by PersonRegistry + ReID, so this tracker only
+        needs to stay stable frame-to-frame without aggressive matching that causes swaps.
+
         Args:
-            max_missing_frames: Frames before dropping track (120 @ 8fps = ~15 seconds)
-            iou_match_threshold: Lower threshold = more lenient matching for moving people
-            centroid_fallback_dist: Max pixel distance for centroid matching when IoU fails
+            max_missing_frames: Frames before dropping a track (60 @ ~8 fps ≈ 7.5 s)
+            iou_match_threshold: Minimum IoU to bind a detection to an existing track
+            centroid_fallback_dist: Max pixel distance for centroid fallback matching
         """
         self.max_missing_frames = max_missing_frames
         self.iou_match_threshold = iou_match_threshold
@@ -205,10 +209,12 @@ class ReIDMemory:
 
     def __init__(
         self,
-        similarity_threshold: float = 0.62,
-        ttl_seconds: float = 3600.0,  # 1 hour default (was 10 min)
+        similarity_threshold: float = 0.72,
+        ttl_seconds: float = 1200.0,  # 20 minute pause/resume window by default
         max_embeddings_per_person: int = 5,  # Store multiple views
         embedding_update_interval: float = 5.0,  # Only update embedding every 5 seconds
+        min_crop_side: int = 40,  # Reject crops smaller than this in any dimension
+        min_crop_area: int = 3000,  # Reject crops with total area below this
     ) -> None:
         # Lazy-import torchvision to avoid making it a hard runtime dependency
         try:
@@ -249,10 +255,27 @@ class ReIDMemory:
         self.ttl_seconds = ttl_seconds
         self.max_embeddings_per_person = max_embeddings_per_person
         self.embedding_update_interval = embedding_update_interval
-        
+        self.min_crop_side = min_crop_side
+        self.min_crop_area = min_crop_area
+
         # Track recently matched to prevent same-frame double matching
         self._frame_matched_pids: set = set()
         self._last_frame_time: float = 0.0
+
+    def is_crop_usable(self, crop_bgr: np.ndarray) -> bool:
+        """Gate low-quality crops out of ReID to avoid unreliable embeddings."""
+        if crop_bgr is None or crop_bgr.size == 0:
+            return False
+        h, w = crop_bgr.shape[:2]
+        if h < self.min_crop_side or w < self.min_crop_side:
+            return False
+        if h * w < self.min_crop_area:
+            return False
+        # Person boxes should be roughly vertical (taller than wide); reject absurd ratios
+        ratio = h / max(w, 1)
+        if ratio < 0.8 or ratio > 5.0:
+            return False
+        return True
 
     @staticmethod
     def _cosine_similarity(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -280,46 +303,44 @@ class ReIDMemory:
             self._frame_matched_pids.clear()
             self._last_frame_time = now_s
 
-    def assign_person_id(self, crop_bgr: np.ndarray, now_s: float) -> int:
-        emb = self._extract_embedding(crop_bgr)
-        
-        # Purge old entries (expired after ttl_seconds of no visibility)
+    def _purge_expired(self, now_s: float) -> None:
         expired = [pid for pid, ts in self.person_id_to_last_seen.items() if now_s - ts > self.ttl_seconds]
         for pid in expired:
             self.person_id_to_last_seen.pop(pid, None)
             self.person_id_to_embeddings.pop(pid, None)
             self.person_id_to_last_embedding_update.pop(pid, None)
 
-        # Find best match (against multi-embedding galleries)
-        best_pid = None
+    def match_person_id(
+        self,
+        crop_bgr: np.ndarray,
+        now_s: float,
+        exclude_pids: Optional[set] = None,
+    ) -> Tuple[Optional[int], float]:
+        """Attempt to match a crop to an existing person_id. Returns (pid or None, similarity)."""
+        if not self.is_crop_usable(crop_bgr):
+            return None, -1.0
+        self._purge_expired(now_s)
+        emb = self._extract_embedding(crop_bgr)
+        best_pid: Optional[int] = None
         best_sim = -1.0
         for pid, gallery in self.person_id_to_embeddings.items():
-            # Skip if already matched this frame (prevents double-matching)
             if pid in self._frame_matched_pids:
+                continue
+            if exclude_pids and pid in exclude_pids:
                 continue
             sim = self._match_against_gallery(emb, gallery)
             if sim > best_sim:
                 best_sim = sim
                 best_pid = pid
-
         if best_pid is not None and best_sim >= self.similarity_threshold:
-            # Update gallery with new view (throttled, not every frame)
-            last_update = self.person_id_to_last_embedding_update.get(best_pid, 0.0)
-            if now_s - last_update > self.embedding_update_interval:
-                gallery = self.person_id_to_embeddings[best_pid]
-                if len(gallery) < self.max_embeddings_per_person:
-                    gallery.append(emb)
-                else:
-                    # Replace oldest embedding (FIFO)
-                    gallery.pop(0)
-                    gallery.append(emb)
-                self.person_id_to_last_embedding_update[best_pid] = now_s
-            
-            self.person_id_to_last_seen[best_pid] = now_s
-            self._frame_matched_pids.add(best_pid)
-            return best_pid
+            return best_pid, best_sim
+        return None, best_sim
 
-        # New identity
+    def register_new_person(self, crop_bgr: np.ndarray, now_s: float) -> Optional[int]:
+        """Create a new person identity from a usable crop. Returns the new pid or None if crop is bad."""
+        if not self.is_crop_usable(crop_bgr):
+            return None
+        emb = self._extract_embedding(crop_bgr)
         pid = self.next_person_id
         self.next_person_id += 1
         self.person_id_to_embeddings[pid] = [emb]
@@ -327,6 +348,274 @@ class ReIDMemory:
         self.person_id_to_last_embedding_update[pid] = now_s
         self._frame_matched_pids.add(pid)
         return pid
+
+    def touch_person(self, pid: int, crop_bgr: np.ndarray, now_s: float) -> None:
+        """Mark person seen this frame and optionally refresh their embedding gallery."""
+        self.person_id_to_last_seen[pid] = now_s
+        self._frame_matched_pids.add(pid)
+        if not self.is_crop_usable(crop_bgr):
+            return
+        last_update = self.person_id_to_last_embedding_update.get(pid, 0.0)
+        if now_s - last_update <= self.embedding_update_interval:
+            return
+        emb = self._extract_embedding(crop_bgr)
+        gallery = self.person_id_to_embeddings.setdefault(pid, [])
+        if len(gallery) < self.max_embeddings_per_person:
+            gallery.append(emb)
+        else:
+            gallery.pop(0)
+            gallery.append(emb)
+        self.person_id_to_last_embedding_update[pid] = now_s
+
+    def assign_person_id(self, crop_bgr: np.ndarray, now_s: float) -> int:
+        """Legacy API: match or create. Prefer match_person_id + register_new_person for new code."""
+        if not self.is_crop_usable(crop_bgr):
+            # Still allocate an ID so callers don't crash, but skip gallery operations
+            pid = self.next_person_id
+            self.next_person_id += 1
+            return pid
+        pid, _ = self.match_person_id(crop_bgr, now_s)
+        if pid is not None:
+            self.touch_person(pid, crop_bgr, now_s)
+            return pid
+        new_pid = self.register_new_person(crop_bgr, now_s)
+        return new_pid if new_pid is not None else -1
+
+
+@dataclass
+class PersonRecord:
+    label_id: int
+    reid_pid: Optional[int]
+    first_seen_s: float
+    last_seen_s: float
+    accumulated_wait_s: float  # Only ticks while the person is visible
+    is_visible: bool
+    current_tid: Optional[int]
+    last_reid_check_s: float = 0.0
+    last_bbox: Optional[np.ndarray] = None
+
+
+class PersonRegistry:
+    """
+    Owns persistent person identities and wait-time accumulation.
+
+    Key guarantees:
+    - `accumulated_wait_s` only ticks while a person is actually visible.
+    - When a person disappears, they are kept as "absent" for `absence_timeout_s`.
+      If they reappear within that window (matched via ReID), their timer resumes.
+    - After the absence window, the identity is forgotten; reappearing creates a new label.
+    """
+
+    def __init__(
+        self,
+        reid: Optional["ReIDMemory"],
+        absence_timeout_s: float = 1200.0,  # 20 minutes
+        reid_reverify_interval_s: float = 4.0,
+    ) -> None:
+        self.reid = reid
+        self.absence_timeout_s = absence_timeout_s
+        self.reid_reverify_interval_s = reid_reverify_interval_s
+        self._records: Dict[int, PersonRecord] = {}
+        self._tid_to_label: Dict[int, int] = {}
+        self._pid_to_label: Dict[int, int] = {}  # ReID pid -> label_id
+        self._next_label_id: int = 1
+
+    def _crop(self, frame: np.ndarray, bbox: np.ndarray) -> np.ndarray:
+        x1, y1, x2, y2 = bbox.astype(int)
+        x1 = max(0, x1)
+        y1 = max(0, y1)
+        x2 = min(frame.shape[1] - 1, x2)
+        y2 = min(frame.shape[0] - 1, y2)
+        return frame[y1:y2, x1:x2]
+
+    def _new_label(self) -> int:
+        lbl = self._next_label_id
+        self._next_label_id += 1
+        return lbl
+
+    def _resolve_label_for_new_track(
+        self,
+        crop: np.ndarray,
+        now_s: float,
+    ) -> Tuple[int, Optional[int]]:
+        """Return (label_id, reid_pid) for a freshly-seen track."""
+        if self.reid is None:
+            return self._new_label(), None
+
+        # Don't match against labels currently visible — they already have live tracks
+        busy_pids = {
+            rec.reid_pid for rec in self._records.values()
+            if rec.is_visible and rec.reid_pid is not None
+        }
+        pid, _sim = self.reid.match_person_id(crop, now_s, exclude_pids=busy_pids)
+        if pid is not None and pid in self._pid_to_label:
+            existing_label = self._pid_to_label[pid]
+            self.reid.touch_person(pid, crop, now_s)
+            return existing_label, pid
+
+        # No match: register a fresh ReID identity AND a new label
+        new_pid = self.reid.register_new_person(crop, now_s)
+        new_label = self._new_label()
+        if new_pid is not None:
+            self._pid_to_label[new_pid] = new_label
+        return new_label, new_pid
+
+    def _reverify_track(
+        self,
+        record: PersonRecord,
+        crop: np.ndarray,
+        now_s: float,
+    ) -> None:
+        """Periodically re-run ReID on an active track to catch tracker swaps."""
+        if self.reid is None:
+            return
+        if now_s - record.last_reid_check_s < self.reid_reverify_interval_s:
+            return
+        record.last_reid_check_s = now_s
+        if not self.reid.is_crop_usable(crop):
+            return
+        busy_pids = {
+            rec.reid_pid for rec in self._records.values()
+            if rec.is_visible and rec.reid_pid is not None and rec.label_id != record.label_id
+        }
+        pid, _sim = self.reid.match_person_id(crop, now_s, exclude_pids=busy_pids)
+        if pid is None:
+            # Couldn't confirm — just refresh current identity's gallery
+            if record.reid_pid is not None:
+                self.reid.touch_person(record.reid_pid, crop, now_s)
+            return
+        expected_label = self._pid_to_label.get(pid)
+        if expected_label == record.label_id:
+            # Confirmed; refresh gallery
+            self.reid.touch_person(pid, crop, now_s)
+            return
+        # Mismatch: tracker likely swapped identities. Rebind this track to the correct label.
+        if expected_label is None:
+            # ReID found a pid with no label yet (shouldn't happen often) — bind it to current label
+            self._pid_to_label[pid] = record.label_id
+            record.reid_pid = pid
+            self.reid.touch_person(pid, crop, now_s)
+            return
+        # Swap: reassign this tid to the correct label
+        if record.current_tid is not None:
+            self._tid_to_label[record.current_tid] = expected_label
+            target = self._records.get(expected_label)
+            if target is not None:
+                target.current_tid = record.current_tid
+                target.is_visible = True
+                target.last_seen_s = now_s
+                target.last_bbox = record.last_bbox
+        # Mark the old record absent
+        record.current_tid = None
+        record.is_visible = False
+
+    def update(
+        self,
+        frame: np.ndarray,
+        tracked: Dict[int, np.ndarray],
+        now_s: float,
+        dt: float,
+    ) -> Dict[int, PersonRecord]:
+        """
+        Advance the registry one frame.
+
+        Args:
+            frame: the current BGR frame (used for ReID crops).
+            tracked: {tid -> bbox} from IoUTracker.step()
+            now_s: wall-clock time in seconds.
+            dt: seconds since the previous frame (clamped sensibly).
+
+        Returns: {label_id -> PersonRecord} for visible persons this frame.
+        """
+        # Clamp dt: if a frame hangs for many seconds, don't accumulate that whole gap
+        dt_clamped = max(0.0, min(dt, 2.0))
+
+        # Reset ReID per-frame matched cache
+        if self.reid is not None:
+            self.reid.clear_frame_cache(now_s)
+
+        # 1) Mark all records not visible; we'll re-mark visible ones below
+        for rec in self._records.values():
+            rec.is_visible = False
+            rec.current_tid = None
+
+        visible_labels: Dict[int, PersonRecord] = {}
+
+        for tid, bbox in tracked.items():
+            crop = self._crop(frame, bbox)
+            label_id = self._tid_to_label.get(tid)
+
+            if label_id is None:
+                # New track: try ReID match against absent persons first
+                label_id, pid = self._resolve_label_for_new_track(crop, now_s)
+                self._tid_to_label[tid] = label_id
+                if label_id not in self._records:
+                    self._records[label_id] = PersonRecord(
+                        label_id=label_id,
+                        reid_pid=pid,
+                        first_seen_s=now_s,
+                        last_seen_s=now_s,
+                        accumulated_wait_s=0.0,
+                        is_visible=True,
+                        current_tid=tid,
+                        last_reid_check_s=now_s,
+                        last_bbox=bbox,
+                    )
+                else:
+                    rec = self._records[label_id]
+                    if rec.reid_pid is None and pid is not None:
+                        rec.reid_pid = pid
+                    rec.is_visible = True
+                    rec.current_tid = tid
+                    rec.last_seen_s = now_s
+                    rec.last_reid_check_s = now_s
+                    rec.last_bbox = bbox
+                    # Don't add dt on the first frame we re-bind — will tick next frame
+            else:
+                rec = self._records.get(label_id)
+                if rec is None:
+                    # Stale binding — rebuild
+                    self._tid_to_label.pop(tid, None)
+                    continue
+                if rec.is_visible:
+                    # Already claimed by another tid this frame; drop this duplicate assignment
+                    self._tid_to_label.pop(tid, None)
+                    continue
+                rec.is_visible = True
+                rec.current_tid = tid
+                rec.accumulated_wait_s += dt_clamped
+                rec.last_seen_s = now_s
+                rec.last_bbox = bbox
+                # Periodic re-verification
+                self._reverify_track(rec, crop, now_s)
+
+            visible_labels[self._tid_to_label[tid]] = self._records[self._tid_to_label[tid]]
+
+        # 2) Clean up stale tid bindings (tids not in current tracker output)
+        for tid in list(self._tid_to_label.keys()):
+            if tid not in tracked:
+                self._tid_to_label.pop(tid, None)
+
+        # 3) Purge records past the absence window
+        to_drop: List[int] = []
+        for lbl, rec in self._records.items():
+            if rec.is_visible:
+                continue
+            if now_s - rec.last_seen_s > self.absence_timeout_s:
+                to_drop.append(lbl)
+        for lbl in to_drop:
+            rec = self._records.pop(lbl, None)
+            if rec is not None and rec.reid_pid is not None:
+                self._pid_to_label.pop(rec.reid_pid, None)
+
+        return visible_labels
+
+    def wait_seconds(self, label_id: int) -> float:
+        rec = self._records.get(label_id)
+        return rec.accumulated_wait_s if rec else 0.0
+
+    def snapshot(self) -> Dict[int, PersonRecord]:
+        return dict(self._records)
 
 
 def format_hms(seconds: float) -> str:

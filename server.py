@@ -13,6 +13,7 @@ import torch
 
 from main import (
     IoUTracker,
+    PersonRegistry,
     ReIDMemory,
     format_hms,
     draw_label_with_background,
@@ -45,40 +46,42 @@ except Exception:
 RTSP_URL = os.environ.get("RTSP_URL", "").strip()
 CONF_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.4"))
 REID_ENABLED = os.environ.get("REID", "1").strip() not in ("0", "false", "False", "")
-REID_SIM = float(os.environ.get("REID_SIM", "0.62"))
-# ReID TTL: how long to remember a person (default 1 hour = 3600 seconds)
-REID_TTL = float(os.environ.get("REID_TTL", "3600"))
-# IoU tracker: how many frames before dropping a track (default 90 frames @ ~8fps = ~11 seconds)
-MAX_MISSING_FRAMES = int(os.environ.get("MAX_MISSING_FRAMES", "90"))
+REID_SIM = float(os.environ.get("REID_SIM", "0.72"))
+# Absence window: how long a person's timer is kept alive after they leave the frame.
+# If they return within this window, the timer resumes. Default 20 minutes.
+ABSENCE_TIMEOUT_S = float(os.environ.get("ABSENCE_TIMEOUT_S", "1200"))
+# IoU tracker: how many frames before dropping a track (default 60 frames @ ~8fps ≈ 7.5s).
+# Long-term re-identification is now handled by PersonRegistry+ReID, so this can be short.
+MAX_MISSING_FRAMES = int(os.environ.get("MAX_MISSING_FRAMES", "60"))
+# Reject detections smaller than this area (pixels) — filters noise / distant false positives.
+MIN_DETECTION_AREA = int(os.environ.get("MIN_DETECTION_AREA", "2500"))
+# How often to re-run ReID on an established track to catch tracker swaps.
+REID_REVERIFY_INTERVAL_S = float(os.environ.get("REID_REVERIFY_INTERVAL_S", "4.0"))
 
 
 # Global state
 _yolo_model: Optional[YOLO] = None  # lazy-loaded when needed
-# Use more lenient tracking parameters to reduce ID churn
 tracker = IoUTracker(
     max_missing_frames=MAX_MISSING_FRAMES,
-    iou_match_threshold=0.10,  # Very lenient IoU matching
-    centroid_fallback_dist=200.0,  # Larger fallback distance for centroid matching
+    iou_match_threshold=0.30,
+    centroid_fallback_dist=120.0,
 )
-# ReID is expensive - only use it for new tracks, not every frame
-effective_reid_sim = min(REID_SIM, 0.50)  # Lower threshold for better matching
 reid_memory: Optional[ReIDMemory] = ReIDMemory(
-    similarity_threshold=effective_reid_sim,
-    ttl_seconds=REID_TTL,
+    similarity_threshold=REID_SIM,
+    ttl_seconds=ABSENCE_TIMEOUT_S,
     max_embeddings_per_person=5,
-    embedding_update_interval=10.0,  # Less frequent updates to reduce CPU
+    embedding_update_interval=10.0,
 ) if REID_ENABLED else None
-track_to_label: Dict[int, int] = {}
-# Store label -> reid_ids mapping for recovery
-label_to_reid_ids: Dict[int, set] = {}
-next_label_id: int = 1
-# person_id -> earliest start time (ReID-aware or tracker-based)
-person_start_times: Dict[int, float] = {}
-person_last_seen: Dict[int, float] = {}
-# Track which tids we've already done ReID on (to avoid repeated expensive calls)
-reid_done_for_tid: Dict[int, float] = {}  # tid -> last_reid_time
+registry = PersonRegistry(
+    reid=reid_memory,
+    absence_timeout_s=ABSENCE_TIMEOUT_S,
+    reid_reverify_interval_s=REID_REVERIFY_INTERVAL_S,
+)
 
-logger.info("ReID enabled: %s", bool(reid_memory))
+logger.info(
+    "ReID enabled: %s, sim=%.2f, absence=%.0fs, max_missing=%d, min_area=%d",
+    bool(reid_memory), REID_SIM, ABSENCE_TIMEOUT_S, MAX_MISSING_FRAMES, MIN_DETECTION_AREA,
+)
 
 # Shared capture for lightweight snapshot endpoint
 _snap_cap: Optional[cv2.VideoCapture] = None
@@ -227,7 +230,6 @@ def _placeholder_frame(text: str = "Starting…") -> bytes:
 
 
 def frame_generator():
-    global next_label_id
     cap = None
     fps_smoother = None
     last_time = time.time()
@@ -321,16 +323,24 @@ def frame_generator():
                 detections[:, [0, 2]] *= ratio_x
                 detections[:, [1, 3]] *= ratio_y
 
+            # Filter tiny/noise detections — unreliable for both tracking and ReID
+            if detections.size > 0 and MIN_DETECTION_AREA > 0:
+                areas = (detections[:, 2] - detections[:, 0]) * (detections[:, 3] - detections[:, 1])
+                detections = detections[areas >= MIN_DETECTION_AREA]
+
             frame_idx += 1
             tracked: Dict[int, np.ndarray] = tracker.step(frame_idx, detections, now_s)
-            active_labels = {label for tid_active, label in track_to_label.items() if tid_active in tracker._tracks}
-            frame_labels: set[int] = set()
 
-            # Clear ReID frame cache at start of each frame to prevent double-matching
-            if reid_memory is not None:
-                reid_memory.clear_frame_cache(now_s)
+            # PersonRegistry owns label assignment, ReID, and pause/resume timing
+            visible = registry.update(frame, tracked, now_s, dt)
 
-            for tid, bbox in tracked.items():
+            # Draw boxes + labels using the registry's accumulated wait times
+            tid_to_bbox = tracked
+            for label_id, rec in visible.items():
+                tid = rec.current_tid
+                if tid is None or tid not in tid_to_bbox:
+                    continue
+                bbox = tid_to_bbox[tid]
                 x1, y1, x2, y2 = bbox.astype(int)
                 x1 = max(0, x1)
                 y1 = max(0, y1)
@@ -338,74 +348,16 @@ def frame_generator():
                 y2 = min(frame.shape[0] - 1, y2)
 
                 cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
-
-                # Check if this track already has a label
-                label_id = track_to_label.get(tid)
-
-                if label_id is None:
-                    # NEW TRACK - this is the only time we run ReID (expensive)
-                    reid_suggested_label: Optional[int] = None
-                    current_reid_id: Optional[int] = None
-                    
-                    if reid_memory is not None:
-                        crop = frame[y1:y2, x1:x2]
-                        if crop.size > 0 and crop.shape[0] > 20 and crop.shape[1] > 20:
-                            current_reid_id = reid_memory.assign_person_id(crop, now_s)
-                            reid_done_for_tid[tid] = now_s
-                            # Check if this reid_id was previously associated with a label
-                            if current_reid_id is not None:
-                                for lbl, reid_set in label_to_reid_ids.items():
-                                    if current_reid_id in reid_set and lbl not in frame_labels:
-                                        reid_suggested_label = lbl
-                                        break
-                    
-                    if reid_suggested_label is not None:
-                        # ReID matched an existing person - reuse their label
-                        label_id = reid_suggested_label
-                    else:
-                        # Truly new person - assign new label
-                        label_id = next_label_id
-                        next_label_id += 1
-                    
-                    track_to_label[tid] = label_id
-                    
-                    # Store ReID association for future recovery
-                    if current_reid_id is not None:
-                        if label_id not in label_to_reid_ids:
-                            label_to_reid_ids[label_id] = set()
-                        label_to_reid_ids[label_id].add(current_reid_id)
-                
-                # Once a track has a label, KEEP IT (don't let ReID override)
-                # This prevents ID flickering
-                
-                frame_labels.add(label_id)
-                active_labels.add(label_id)
-
-                if label_id not in person_start_times:
-                    start_time_s = tracker.get_track_start_time(tid) or now_s
-                    person_start_times[label_id] = start_time_s
-                start_time_s = person_start_times[label_id]
-                wait_s = now_s - start_time_s
-                time_text = f"ID {label_id} · {format_hms(wait_s)}"
-                person_last_seen[label_id] = now_s
-                if logger.isEnabledFor(logging.DEBUG):
-                    logger.debug(
-                        "Track tid=%d assigned person_id=%d bbox=(%d,%d,%d,%d) wait=%.1fs",
-                        tid,
-                        label_id,
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                        wait_s,
-                    )
+                time_text = f"ID {label_id} · {format_hms(rec.accumulated_wait_s)}"
                 label_x = int((x1 + x2) / 2)
                 label_y = max(0, y1 - 6)
                 draw_label_with_background(frame, time_text, (label_x, label_y), font_scale=0.6, bg_color=(50, 50, 50))
 
-            # Overlay FPS
-            fps_text = f"FPS: {fps_smoother:.1f}"
-            cv2.putText(frame, fps_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            # Overlay FPS + active/absent counts for quick eyeballing
+            all_records = registry.snapshot()
+            absent_count = sum(1 for r in all_records.values() if not r.is_visible)
+            hud_text = f"FPS: {fps_smoother:.1f}  live: {len(visible)}  waiting (absent): {absent_count}"
+            cv2.putText(frame, hud_text, (12, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
             # Encode JPEG
             jpg = _encode_jpeg(frame)
@@ -421,19 +373,7 @@ def frame_generator():
                 fps_smoother or 0.0,
             )
 
-            # Cleanup stale person entries (match ReID TTL, default 1 hour)
-            stale_cutoff = now_s - REID_TTL
-            stale_ids = [pid for pid, ts in person_last_seen.items() if ts < stale_cutoff]
-            for pid in stale_ids:
-                person_last_seen.pop(pid, None)
-                person_start_times.pop(pid, None)
-                label_to_reid_ids.pop(pid, None)
-
-            current_tids = set(tracker._tracks.keys())
-            for tid_old in list(track_to_label.keys()):
-                if tid_old not in current_tids:
-                    track_to_label.pop(tid_old, None)
-                    reid_done_for_tid.pop(tid_old, None)
+            # PersonRegistry handles its own cleanup (absence timeout + tid unbind)
 
             # Periodic garbage collection to prevent memory buildup
             if now_s - last_gc_time > GC_INTERVAL:
