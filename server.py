@@ -77,6 +77,9 @@ CAMERA_NAME = os.environ.get("CAMERA_NAME", "").strip() or "unknown"
 DB_PATH = os.environ.get("DB_PATH", analytics.DEFAULT_DB_PATH).strip()
 # When True, completed wait sessions are persisted to the analytics DB.
 WAIT_LOGGING = os.environ.get("WAIT_LOGGING", "1").strip() not in ("0", "false", "False", "")
+# Bounding-box color flips from yellow to red once a person has been waiting
+# this long (seconds). Default 600 = 10 minutes.
+RED_ALERT_AFTER_S = float(os.environ.get("RED_ALERT_AFTER_S", "600"))
 
 
 # Global state
@@ -428,11 +431,22 @@ def frame_generator():
                 x2 = min(frame.shape[1] - 1, x2)
                 y2 = min(frame.shape[0] - 1, y2)
 
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 255), 2)
+                # Yellow until RED_ALERT_AFTER_S, then red — flag long waits visually.
+                # OpenCV uses BGR; (0,200,255)=amber-yellow, (0,0,220)=red.
+                if rec.accumulated_wait_s >= RED_ALERT_AFTER_S:
+                    box_color = (0, 0, 220)
+                    label_bg = (0, 0, 160)
+                    box_thickness = 3
+                else:
+                    box_color = (0, 200, 255)
+                    label_bg = (50, 50, 50)
+                    box_thickness = 2
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, box_thickness)
                 time_text = f"ID {label_id} · {format_hms(rec.accumulated_wait_s)}"
                 label_x = int((x1 + x2) / 2)
                 label_y = max(0, y1 - 6)
-                draw_label_with_background(frame, time_text, (label_x, label_y), font_scale=0.6, bg_color=(50, 50, 50))
+                draw_label_with_background(frame, time_text, (label_x, label_y), font_scale=0.6, bg_color=label_bg)
 
             # Overlay FPS + active/absent counts for quick eyeballing
             all_records = registry.snapshot()
