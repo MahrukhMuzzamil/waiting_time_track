@@ -17,8 +17,12 @@ set -euo pipefail
 PROJECT_DIR="/home/aesthetics-lab/50"
 USER_NAME="aesthetics-lab"
 VENV_GUNICORN="$PROJECT_DIR/.venv/bin/gunicorn"
+VENV_PIP="$PROJECT_DIR/.venv/bin/pip"
 ETC_DIR="/etc/ai-track"
 UNIT_DIR="/etc/systemd/system"
+DATA_DIR="/var/lib/ai-track"
+DB_PATH="$DATA_DIR/waittime.db"
+LOGIN_GATEWAY_PORT=8010
 
 # name -> "port:rtsp_url"
 declare -A CAMERAS=(
@@ -36,16 +40,26 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# 0) Make sure openpyxl is installed (added for analytics/Excel exports)
+if [[ -x "$VENV_PIP" ]]; then
+    sudo -u "$USER_NAME" "$VENV_PIP" install --quiet 'openpyxl==3.1.5' || true
+fi
+
+# 0b) Shared analytics directory writable by camera processes + login gateway
+mkdir -p "$DATA_DIR"
+chown -R "$USER_NAME:$USER_NAME" "$DATA_DIR"
+chmod 775 "$DATA_DIR"
+
 # 1) /etc/ai-track + common.env
 mkdir -p "$ETC_DIR"
 chmod 755 "$ETC_DIR"
 
 echo "Writing $ETC_DIR/common.env (shared tuning)"
-cat > "$ETC_DIR/common.env" <<'EOF'
+cat > "$ETC_DIR/common.env" <<EOF
 # AI Track App — shared tuning for ALL cameras.
 # Edit values here and run:
 #   sudo systemctl restart 'dha-cam*' 'mm-cam*' 'fsd*'
-# Format: KEY=VALUE, no quotes, no spaces around `=`.
+# Format: KEY=VALUE, no quotes, no spaces around \`=\`.
 
 # --- YOLO detection ---
 YOLO_MODEL=yolov8s.pt
@@ -63,8 +77,13 @@ REID_SIM=0.70
 REID_REVERIFY_MARGIN=0.12
 ABSENCE_TIMEOUT_S=1200
 
+# --- Wait-time analytics ---
+WAIT_LOGGING=1
+DB_PATH=$DB_PATH
+MIN_LOGGED_WAIT_S=5
+
 # --- Process env ---
-PATH=/home/aesthetics-lab/50/.venv/bin:/usr/bin
+PATH=$PROJECT_DIR/.venv/bin:/usr/bin
 EOF
 chmod 644 "$ETC_DIR/common.env"
 
@@ -80,6 +99,7 @@ for name in "${!CAMERAS[@]}"; do
 # Shared tuning (model, ReID, etc.) lives in common.env.
 RTSP_URL=${rtsp_url}
 PORT=${port}
+CAMERA_NAME=${name}
 EOF
     chmod 644 "$ETC_DIR/${name}.env"
 done
@@ -115,6 +135,30 @@ EOF
     fi
 done
 
+# 3b) Login gateway service (port 8010) — serves dashboard + reports + Excel exports
+echo "Writing $UNIT_DIR/login-gateway.service"
+cat > "$UNIT_DIR/login-gateway.service" <<EOF
+[Unit]
+Description=AI Track App - Login Gateway + Reports Dashboard
+After=network.target
+
+[Service]
+User=${USER_NAME}
+WorkingDirectory=${PROJECT_DIR}
+EnvironmentFile=${ETC_DIR}/common.env
+Environment="FLASK_SECRET_KEY="
+ExecStart=${VENV_GUNICORN} login_gateway:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:${LOGIN_GATEWAY_PORT}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+if command -v ufw >/dev/null 2>&1; then
+    ufw allow "${LOGIN_GATEWAY_PORT}/tcp" >/dev/null 2>&1 || true
+fi
+
 # 4) Reload + enable + restart
 echo ""
 echo "Reloading systemd…"
@@ -128,6 +172,10 @@ for name in "${!CAMERAS[@]}"; do
     echo "  restarted ${name}"
 done
 
+systemctl enable login-gateway.service >/dev/null 2>&1
+systemctl restart login-gateway.service
+echo "  restarted login-gateway"
+
 echo ""
 echo "Waiting 5s for startup…"
 sleep 5
@@ -136,11 +184,18 @@ echo ""
 echo "Status:"
 for name in "${!CAMERAS[@]}"; do
     state=$(systemctl is-active "${name}.service" 2>/dev/null || echo unknown)
-    printf "  %-10s %s\n" "${name}:" "${state}"
+    printf "  %-15s %s\n" "${name}:" "${state}"
 done
+state=$(systemctl is-active login-gateway.service 2>/dev/null || echo unknown)
+printf "  %-15s %s\n" "login-gateway:" "${state}"
 
 echo ""
 echo "Done."
+echo ""
+LAN_IP=$(hostname -I | awk '{print $1}')
+echo "Dashboard:   http://${LAN_IP}:${LOGIN_GATEWAY_PORT}/login"
+echo "Reports:     http://${LAN_IP}:${LOGIN_GATEWAY_PORT}/reports"
+echo "Analytics DB: $DB_PATH"
 echo ""
 echo "To re-tune ALL cameras at once:"
 echo "  sudo nano $ETC_DIR/common.env"

@@ -422,11 +422,15 @@ class PersonRegistry:
         absence_timeout_s: float = 1200.0,  # 20 minutes
         reid_reverify_interval_s: float = 4.0,
         reid_reverify_margin: float = 0.10,
+        on_session_end: Optional[callable] = None,
     ) -> None:
         self.reid = reid
         self.absence_timeout_s = absence_timeout_s
         self.reid_reverify_interval_s = reid_reverify_interval_s
         self.reid_reverify_margin = reid_reverify_margin
+        # Called with a PersonRecord when their absence window expires.
+        # Fired exactly once per identity, after they're effectively done waiting.
+        self.on_session_end = on_session_end
         self._records: Dict[int, PersonRecord] = {}
         self._tid_to_label: Dict[int, int] = {}
         self._pid_to_label: Dict[int, int] = {}  # ReID pid -> label_id
@@ -631,7 +635,7 @@ class PersonRegistry:
             if tid not in tracked:
                 self._tid_to_label.pop(tid, None)
 
-        # 3) Purge records past the absence window
+        # 3) Purge records past the absence window. Their wait is final — log it.
         to_drop: List[int] = []
         for lbl, rec in self._records.items():
             if rec.is_visible:
@@ -640,8 +644,16 @@ class PersonRegistry:
                 to_drop.append(lbl)
         for lbl in to_drop:
             rec = self._records.pop(lbl, None)
-            if rec is not None and rec.reid_pid is not None:
+            if rec is None:
+                continue
+            if rec.reid_pid is not None:
                 self._pid_to_label.pop(rec.reid_pid, None)
+            if self.on_session_end is not None:
+                try:
+                    self.on_session_end(rec)
+                except Exception:
+                    # Never let logging break the frame loop
+                    pass
 
         return visible_labels
 

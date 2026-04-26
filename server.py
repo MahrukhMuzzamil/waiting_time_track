@@ -14,11 +14,13 @@ import torch
 from main import (
     IoUTracker,
     PersonRegistry,
+    PersonRecord,
     ReIDMemory,
     format_hms,
     draw_label_with_background,
     open_rtsp_with_fallbacks,
 )
+import analytics
 
 
 logging.basicConfig(
@@ -69,6 +71,12 @@ YOLO_IMGSZ = int(os.environ.get("YOLO_IMGSZ", "640"))
 USE_YOLO_TRACK = os.environ.get("USE_YOLO_TRACK", "1").strip() not in ("0", "false", "False", "")
 # Tracker config name — "bytetrack.yaml" (default) or "botsort.yaml".
 YOLO_TRACKER = os.environ.get("YOLO_TRACKER", "bytetrack.yaml").strip()
+# Identifies this camera in the analytics DB. Set per-camera in the env file.
+CAMERA_NAME = os.environ.get("CAMERA_NAME", "").strip() or "unknown"
+# Analytics DB path. Set in common.env so all cameras share one DB.
+DB_PATH = os.environ.get("DB_PATH", analytics.DEFAULT_DB_PATH).strip()
+# When True, completed wait sessions are persisted to the analytics DB.
+WAIT_LOGGING = os.environ.get("WAIT_LOGGING", "1").strip() not in ("0", "false", "False", "")
 
 
 # Global state
@@ -84,20 +92,45 @@ reid_memory: Optional[ReIDMemory] = ReIDMemory(
     max_embeddings_per_person=5,
     embedding_update_interval=10.0,
 ) if REID_ENABLED else None
+if WAIT_LOGGING:
+    try:
+        analytics.init_db(DB_PATH)
+        logger.info("Analytics DB ready at %s (camera=%s)", DB_PATH, CAMERA_NAME)
+    except Exception as exc:
+        logger.error("Failed to init analytics DB at %s: %s", DB_PATH, exc)
+
+
+def _log_completed_session(record: "PersonRecord") -> None:
+    if not WAIT_LOGGING:
+        return
+    try:
+        analytics.log_session(
+            camera=CAMERA_NAME,
+            label_id=record.label_id,
+            first_seen=record.first_seen_s,
+            last_seen=record.last_seen_s,
+            total_wait_s=record.accumulated_wait_s,
+            db_path=DB_PATH,
+        )
+    except Exception as exc:
+        logger.warning("Failed to log session for label=%s: %s", record.label_id, exc)
+
+
 registry = PersonRegistry(
     reid=reid_memory,
     absence_timeout_s=ABSENCE_TIMEOUT_S,
     reid_reverify_interval_s=REID_REVERIFY_INTERVAL_S,
     reid_reverify_margin=REID_REVERIFY_MARGIN,
+    on_session_end=_log_completed_session if WAIT_LOGGING else None,
 )
 
 logger.info(
-    "Config: model=%s imgsz=%d conf=%.2f | tracker=%s (yolo_native=%s) | ReID=%s sim=%.2f margin=%.2f absence=%.0fs | legacy_max_missing=%d min_area=%d",
-    YOLO_MODEL, YOLO_IMGSZ, CONF_THRESHOLD,
+    "Config: camera=%s model=%s imgsz=%d conf=%.2f | tracker=%s (yolo_native=%s) | ReID=%s sim=%.2f margin=%.2f absence=%.0fs | logging=%s db=%s",
+    CAMERA_NAME, YOLO_MODEL, YOLO_IMGSZ, CONF_THRESHOLD,
     YOLO_TRACKER if USE_YOLO_TRACK else "IoU+centroid",
     USE_YOLO_TRACK,
     bool(reid_memory), REID_SIM, REID_REVERIFY_MARGIN, ABSENCE_TIMEOUT_S,
-    MAX_MISSING_FRAMES, MIN_DETECTION_AREA,
+    WAIT_LOGGING, DB_PATH,
 )
 
 # Shared capture for lightweight snapshot endpoint
