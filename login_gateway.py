@@ -243,8 +243,12 @@ def reports():
     today = _today_str()
     one_month_ago = (date.today() - timedelta(days=30)).strftime("%Y-%m-%d")
     date_str = _validate_date(request.args.get("date") or today)
-    from_date = _validate_date(request.args.get("from") or one_month_ago)
-    to_date = _validate_date(request.args.get("to") or today)
+    from_date = _validate_date(
+        request.args.get("from_date") or request.args.get("from") or one_month_ago
+    )
+    to_date = _validate_date(
+        request.args.get("to_date") or request.args.get("to") or today
+    )
     year = int(request.args.get("year") or date.today().year)
 
     sessions = analytics.list_sessions(cam, date_str)
@@ -286,8 +290,12 @@ def reports_daily_xlsx():
 @login_required
 def reports_range_xlsx():
     cam = _validate_camera(request.args.get("camera", ""))
-    from_date = _validate_date(request.args.get("from") or "")
-    to_date = _validate_date(request.args.get("to") or "")
+    from_date = _validate_date(
+        request.args.get("from_date") or request.args.get("from") or ""
+    )
+    to_date = _validate_date(
+        request.args.get("to_date") or request.args.get("to") or ""
+    )
     data = analytics.make_range_xlsx(cam, from_date, to_date)
     return Response(
         data,
@@ -376,10 +384,10 @@ REPORTS_HTML = """
         <input type="date" name="date" value="{{ date }}">
       </label>
       <label>From
-        <input type="date" name="from" value="{{ from_date }}">
+        <input type="date" name="from_date" value="{{ from_date }}">
       </label>
       <label>To
-        <input type="date" name="to" value="{{ to_date }}">
+        <input type="date" name="to_date" value="{{ to_date }}">
       </label>
       <label>Year (monthly)
         <input type="number" name="year" min="2020" max="2100" value="{{ year }}" style="width:90px">
@@ -420,7 +428,7 @@ REPORTS_HTML = """
   <section>
     <h3>Daily averages — {{ from_date }} → {{ to_date }}</h3>
     <div class="actions">
-      <a href="{{ url_for('reports_range_xlsx', camera=camera, **{'from': from_date}, to=to_date) }}">Download daily-range Excel</a>
+      <a href="{{ url_for('reports_range_xlsx', camera=camera, from_date=from_date, to_date=to_date) }}">Download daily-range Excel</a>
     </div>
     {% if daily %}
     <table>
